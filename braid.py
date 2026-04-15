@@ -157,6 +157,21 @@ def _print_response(r: ModelResponse, label: str = "") -> None:
     print(f"└{'─'*58}")
 
 
+def _extract_ts_exports(path: str) -> str:
+    """Extract exported function/const names and their signatures from a .ts file."""
+    try:
+        src = open(path).read()
+        exports = []
+        for m in re.finditer(
+            r'^export\s+(async\s+)?(?:function|const|class|type|interface)\s+(\w+)([^{;\n]*)',
+            src, re.MULTILINE
+        ):
+            exports.append(f"  {m.group(0).rstrip()}")
+        return "\n".join(exports) if exports else "  (no exports found)"
+    except Exception as e:
+        return f"  (could not read: {e})"
+
+
 def _build_context() -> str:
     """
     Reads the real source files and returns a concise architectural context block.
@@ -165,49 +180,74 @@ def _build_context() -> str:
     repo = os.path.dirname(os.path.abspath(__file__))
     sections = []
 
-    # braid.py — the engine itself (key sections only, not full source)
+    # ── 1. File tree — exact paths, no invention possible ──────────────────────
+    tree_lines = [
+        "data/braid-sessions.jsonl   ← LFS session log (append-only)",
+        "braid.py                    ← engine (this file)",
+        "braid_log.py                ← integrity guard + session persistence",
+        "src/",
+        "  index.ts                  ← plugin entry: system prompt injection, tool hooks",
+        "  constraints.ts            ← CONSTRAINT_SETS, DEFAULT_ACTIVE, getActiveConstraints()",
+        "  tool-validator.ts         ← validateToolOutput(toolName, output) → ValidationResult",
+        "  audit.ts                  ← writeAudit(entry), AUDIT_PATH",
+        "  ollama-provider.ts        ← ollamaProviderHook: registers local Ollama models",
+        "  tests/                    ← vitest test suite",
+    ]
+    sections.append("### Repository file tree (exact — do not invent paths not listed here)\n"
+                    + "\n".join(tree_lines))
+
+    # ── 2. braid.py — AST-parsed function signatures ───────────────────────────
     try:
         src = open(os.path.join(repo, "braid.py")).read()
-        # Extract function signatures + docstrings as a skeleton
         tree = ast.parse(src)
         sigs = []
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 args = [a.arg for a in node.args.args]
                 doc = ast.get_docstring(node) or ""
-                sigs.append(f"  {'async ' if isinstance(node, ast.AsyncFunctionDef) else ''}def {node.name}({', '.join(args)}){': ' + doc[:80] if doc else ''}")
+                prefix = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
+                sigs.append(f"  {prefix}def {node.name}({', '.join(args)})"
+                            + (f"  # {doc[:80]}" if doc else ""))
         sections.append("### braid.py — function signatures\n" + "\n".join(sigs))
     except Exception as e:
         sections.append(f"### braid.py — could not parse: {e}")
 
-    # braid_log.py — invariants list (what is being protected)
+    # ── 3. braid_log.py — invariants (what the integrity guard protects) ───────
     try:
         log_src = open(os.path.join(repo, "braid_log.py")).read()
-        # Extract INVARIANT_SECTIONS list
         m = re.search(r'INVARIANT_SECTIONS = \[(.+?)\]', log_src, re.DOTALL)
         if m:
-            sections.append("### braid_log.py — structural invariants protected by integrity guard\n" + m.group(0))
+            sections.append("### braid_log.py — INVARIANT_SECTIONS (must never disappear from braid.py)\n"
+                            + m.group(0))
     except Exception:
         pass
 
-    # src/index.ts — plugin hooks (what the verifier plugin actually does)
+    # ── 4. TypeScript export map — exact exported symbols per file ─────────────
+    ts_files = {
+        "src/index.ts":          os.path.join(repo, "src", "index.ts"),
+        "src/constraints.ts":    os.path.join(repo, "src", "constraints.ts"),
+        "src/tool-validator.ts": os.path.join(repo, "src", "tool-validator.ts"),
+        "src/audit.ts":          os.path.join(repo, "src", "audit.ts"),
+        "src/ollama-provider.ts":os.path.join(repo, "src", "ollama-provider.ts"),
+    }
+    export_lines = []
+    for fname, fpath in ts_files.items():
+        export_lines.append(f"\n{fname}:")
+        export_lines.append(_extract_ts_exports(fpath))
+    sections.append("### TypeScript exports — exact symbols (use only these, not invented names)\n"
+                    + "\n".join(export_lines))
+
+    # ── 5. src/index.ts — full plugin entry (hooks are small) ──────────────────
     try:
         plugin_src = open(os.path.join(repo, "src", "index.ts")).read()
-        sections.append("### src/index.ts (verifier plugin) — first 60 lines\n" + "\n".join(plugin_src.splitlines()[:60]))
-    except Exception:
-        pass
-
-    # src/constraints.ts — active constraint sets
-    try:
-        constraints_src = open(os.path.join(repo, "src", "constraints.ts")).read()
-        sections.append("### src/constraints.ts — constraint sets\n" + "\n".join(constraints_src.splitlines()[:40]))
+        sections.append("### src/index.ts — full source\n" + plugin_src)
     except Exception:
         pass
 
     return (
         "## Braid Engine — Architectural Context\n"
-        "You are running inside this system. The following is the real source code.\n"
-        "Do not invent function names, file names, or data structures not present here.\n\n"
+        "You are running inside this system. The following is the REAL source code.\n"
+        "Do not invent function names, file paths, or data structures not listed here.\n\n"
         + "\n\n".join(sections)
     )
 
