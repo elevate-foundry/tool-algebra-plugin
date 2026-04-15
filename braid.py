@@ -29,6 +29,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -197,7 +198,7 @@ async def braid(
     if no_synth_in_pool and synthesizer in models:
         print(f"  [bias guard] excluded {synthesizer} from pool — it synthesizes but doesn't vote")
     print(f"\n── PHASE 1: PER ({len(pool)} models in parallel) " + "─"*(width-38-len(str(len(pool)))))
-    tasks = [run_opencode(m, per_prompt) for m in pool]
+    tasks = [run_opencode(m, per_prompt, timeout=180) for m in pool]
     responses: list[ModelResponse] = await asyncio.gather(*tasks)
 
     successful = [r for r in responses if not r.error]
@@ -213,8 +214,13 @@ async def braid(
     # ── PHASE 2: POST (synthesis) ─────────────────────────────────────────────
     print(f"\n── PHASE 2: POST (synthesis via {synthesizer}) " + "─"*(width-43-len(synthesizer)))
 
+    # Trim each response to 400 chars so the synthesis prompt doesn't exhaust
+    # the model's output budget before reaching Synthesized Answer / Verification
+    MAX_RESPONSE_CHARS = 400
     responses_block = "\n\n".join(
-        f"### {r.model}\n{r.text}" for r in successful
+        f"### {r.model}\n{r.text[:MAX_RESPONSE_CHARS]}"
+        + ("..." if len(r.text) > MAX_RESPONSE_CHARS else "")
+        for r in successful
     )
     failed_note = (
         f"\nNote: {len(failed)} model(s) failed to respond: {[r.model for r in failed]}."
@@ -222,25 +228,76 @@ async def braid(
     )
 
     post_prompt = (
-        f"INSTRUCTION: Respond with plain text only. Do not call browser or filesystem tools.\n\n"
+        f"INSTRUCTION: Respond with plain text only. Do not call browser or filesystem tools.\n"
+        f"You MUST reproduce each section header EXACTLY as written below, then fill in the content.\n\n"
         f"You are the synthesis agent for a multi-model braid.\n\n"
-        f"Your sealed plan from before the queries ran:\n{sealed_plan}\n\n"
+        f"Sealed plan (Γ): {sealed_plan}\n\n"
         f"Original question: {prompt}\n{failed_note}\n\n"
         f"Model responses:\n\n{responses_block}\n\n"
-        f"Produce a BRAIDED synthesis:\n"
-        f"## Consensus (✓)\n[claims every responding model agreed on]\n\n"
-        f"## Partial agreement (~)\n[claims present in some responses only — note which models]\n\n"
-        f"## Contradictions (✗)\n[direct disagreements — quote both sides with model attribution]\n\n"
+        f"Fill in each section below. Do not skip any section. Do not rename headers.\n\n"
+        f"## Consensus (✓)\n"
+        f"List every claim ALL models agreed on. If none, write 'None identified.'\n\n"
+        f"## Partial agreement (~)\n"
+        f"List claims present in SOME responses only. Name which model(s) made each claim.\n\n"
+        f"## Contradictions (✗)\n"
+        f"List direct disagreements. Quote both sides with model name. If none, write 'None identified.'\n\n"
         f"## Synthesized Answer\n"
-        f"[your best unified answer]\n\n"
-        f"Before finishing, call verify_claim to confirm your synthesis matches "
-        f"the verification criterion you stated in your sealed plan."
+        f"Your best unified answer to the original question, citing which models supported each claim.\n\n"
+        f"## Verification\n"
+        f"State whether your synthesis satisfies the sealed plan's verification criterion. "
+        f"Be explicit: quote the criterion, then judge pass or fail with one sentence of evidence."
     )
 
     post = await run_opencode(synthesizer, post_prompt)
     _print_response(post, label=f"POST [{synthesizer}]")
 
-    if not post.error:
+    if post.error:
+        pass
+    else:
+        # ── Parse and validate braided structure ─────────────────────────────
+        required_sections = [
+            "## Consensus (✓)",
+            "## Partial agreement (~)",
+            "## Contradictions (✗)",
+            "## Synthesized Answer",
+            "## Verification",
+        ]
+        missing = [s for s in required_sections if s not in post.text]
+        if missing:
+            print(f"\n⚠ POST missing sections: {missing}", file=sys.stderr)
+
+        # ── Detect textual verify_claim and route a real verification call ───
+        # Some models write [verification_claim] or verify_claim(...) as prose
+        # instead of making a real tool call. Intercept and make the call properly.
+        textual_verify = re.search(
+            r'\[verification[_\s]?claim\]|verify_claim\s*[:(]',
+            post.text, re.IGNORECASE
+        )
+        if textual_verify:
+            print(f"\n  [braid] detected textual verify_claim — routing real verification call...")
+            # Extract the Synthesized Answer section as the claim to verify
+            synth_match = re.search(
+                r'##\s*Synthesized Answer\s*\n(.+?)(?=##|$)',
+                post.text, re.DOTALL
+            )
+            claim_text = synth_match.group(1).strip()[:300] if synth_match else post.text[:300]
+
+            verify_prompt = (
+                f"INSTRUCTION: Call the verify_claim tool with the following arguments.\n"
+                f"Do not answer in prose. Use the verify_claim tool.\n\n"
+                f"claim: The following synthesis correctly answers '{prompt}': "
+                f"{claim_text[:200]}\n"
+                f"evidence: The synthesis is drawn from {len(successful)} model responses and "
+                f"satisfies the sealed plan criterion: {sealed_plan[:200]}"
+            )
+            verify_result = await run_opencode(synthesizer, verify_prompt)
+            if not verify_result.error:
+                print(f"\n  [verify_claim result]")
+                for line in verify_result.text.splitlines():
+                    print(f"  │  {line}")
+            else:
+                print(f"  [verify_claim failed] {verify_result.error}", file=sys.stderr)
+
         print(f"\n{'═'*width}")
         print("BRAIDED OUTPUT")
         print(f"{'═'*width}")
