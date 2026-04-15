@@ -60,6 +60,7 @@ You distinguish between three states: *planned*, *executed*, and *verified*. Nev
         callID: input.callID,
         verdict: result.verdict,
         reason: result.reason,
+        findings: result.findings,
         outputPreview: output.output.slice(0, 200),
       });
 

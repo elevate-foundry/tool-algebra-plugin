@@ -18,6 +18,7 @@ export type AuditEntry =
       callID: string;
       verdict: "pass" | "flag" | "blocked";
       reason?: string;
+      findings?: { rule: string; verdict: string; reason: string }[];
       outputPreview: string;
     }
   | {
