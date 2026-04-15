@@ -298,12 +298,48 @@ async def braid(
     print("── PHASE 0: PRE (sealing plan) " + "─"*(width-31))
     arch_context = _build_context()
 
+    # Build the valid Python symbol map from the real AST — injected into refine Γ
+    # so granite cannot approve proposals using methods that don't exist.
+    try:
+        _src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "braid.py")).read()
+        _tree = ast.parse(_src)
+        _valid_symbols = sorted({
+            node.name
+            for node in ast.walk(_tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        })
+        _dc_fields = sorted({
+            node.targets[0].id
+            for node in ast.walk(_tree)
+            if isinstance(node, ast.Assign)
+            and hasattr(node.targets[0], 'id')
+        })
+        SYMBOL_MAP = (
+            f"Valid Python functions in braid.py: {', '.join(_valid_symbols)}\n"
+            f"Valid module-level names: {', '.join(_dc_fields[:20])}\n"
+            f"Valid TypeScript exports: validateToolOutput (src/tool-validator.ts), "
+            f"writeAudit (src/audit.ts), getActiveConstraints (src/constraints.ts), "
+            f"ollamaProviderHook (src/ollama-provider.ts)"
+        )
+    except Exception:
+        SYMBOL_MAP = "(symbol map unavailable)"
+
     def _make_pre_prompt(prior_fail: Optional[str] = None) -> str:
-        fail_block = (
-            f"\nIMPORTANT: A previous braid run on this same question produced Verification: FAIL.\n"
-            f"The failure reason was:\n{prior_fail}\n"
-            f"Your sealed plan MUST explicitly forbid the failure modes above.\n"
-        ) if prior_fail else ""
+        if prior_fail:
+            fail_block = (
+                f"\nIMPORTANT: A previous braid run on this same question produced Verification: FAIL.\n"
+                f"Failure reason:\n{prior_fail}\n\n"
+                f"STRICT SYMBOL CONSTRAINT (Tropical Barrier — cost ∞ for unknown symbols):\n"
+                f"{SYMBOL_MAP}\n"
+                f"Your sealed plan MUST:\n"
+                f"  1. Explicitly state: FAIL if any proposal uses a method/function/class "
+                f"not listed in the symbol map above.\n"
+                f"  2. Explicitly state: FAIL if any proposal mixes Python and TypeScript syntax.\n"
+                f"  3. Explicitly state: FAIL if the Contradictions section is left blank "
+                f"when model outputs structurally diverge.\n"
+            )
+        else:
+            fail_block = ""
         return (
             f"INSTRUCTION: Respond with plain text only. Do not call any tools.\n\n"
             f"{arch_context}\n\n"
@@ -408,30 +444,45 @@ async def braid(
         if missing:
             print(f"\n⚠ POST missing sections: {missing}", file=sys.stderr)
 
-        # ── Fix 2: Contradictions meta-check ───────────────────────
-        # If models proposed things in different languages / different files,
-        # that IS a contradiction even if no explicit disagreement was stated.
+        # ── Fix 2: Contradictions meta-check (blank OR 'None identified') ────
+        # Gemini: treat empty body the same as 'None identified' —
+        # both are tropical cost-0 paths the synthesizer takes when it's lazy.
         if len(successful) > 1:
-            langs_mentioned = []
+            contra_match = re.search(
+                r'## Contradictions \(✗\)\s*\n(.*?)(?=\n##|$)',
+                post.text, re.DOTALL
+            )
+            contra_body = contra_match.group(1).strip() if contra_match else ""
+            contra_empty = (
+                not contra_body
+                or re.fullmatch(r'[Nn]one identified\.?', contra_body)
+                is not None
+            )
+
+            # Detect structural divergence: different languages across responses
+            lang_profiles = []
             for r in successful:
-                has_py  = bool(re.search(r'def |import |\bpython\b', r.text, re.I))
-                has_ts  = bool(re.search(r'const |=>|interface |\btypescript\b', r.text, re.I))
-                has_js  = bool(re.search(r'\bjavascript\b|function\s+\w+\s*\(', r.text, re.I))
-                langs_mentioned.append((r.model, has_py, has_ts, has_js))
-            mixed = len({(p,t,j) for _,p,t,j in langs_mentioned}) > 1
-            if mixed and "None identified" in post.text:
-                meta_flag = (
-                    "\n⚠ META-CONTRADICTION: models proposed code in different languages "
-                    "(synthetic divergence). Contradictions section should not be 'None identified'."
+                has_py = bool(re.search(r'\bdef \w|\bimport \w', r.text))
+                has_ts = bool(re.search(r'\bconst \w|\b=>\b|\binterface \b', r.text))
+                has_js = bool(re.search(r'\bfunction \w+\s*\(', r.text))
+                lang_profiles.append((has_py, has_ts, has_js))
+            structurally_diverged = len(set(lang_profiles)) > 1
+
+            if structurally_diverged and contra_empty:
+                meta_note = (
+                    "[META] Structural divergence detected by braid engine: "
+                    "models proposed code in different languages/files. "
+                    "Synthesizer reported no contradictions — Tropical Bias active."
                 )
-                print(meta_flag, file=sys.stderr)
-                # Patch the text in-place for the log (does not re-run)
+                print(f"\n\u26a0 META-CONTRADICTION: {meta_note}", file=sys.stderr)
+                # Patch the POST text for the log
+                patched = re.sub(
+                    r'(## Contradictions \(✗\)\s*\n)([^#]*)',
+                    lambda m: m.group(1) + meta_note + "\n",
+                    post.text, count=1, flags=re.DOTALL
+                )
                 post = ModelResponse(
-                    model=post.model, text=post.text.replace(
-                        "## Contradictions (✗)\nNone identified.",
-                        "## Contradictions (✗)\n[META] Models proposed code in different "
-                        "languages/files — structural contradiction detected by braid engine."
-                    ),
+                    model=post.model, text=patched,
                     latency_ms=post.latency_ms, tokens_out=post.tokens_out,
                     events=post.events,
                 )

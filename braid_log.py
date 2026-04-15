@@ -259,20 +259,27 @@ def print_history(n: int = 10) -> None:
     print(f"\n{'═'*70}")
     print(f"BRAID SESSION HISTORY  (last {len(recent)} of {len(sessions)} runs)")
     print(f"{'═'*70}")
-    print(f"{'#':>4}  {'timestamp':19}  {'models':3}  {'verdict':12}  {'cons?':6}  {'contra?':7}  {'integrity':9}  prompt")
-    print(f"{'─'*70}")
+    print(f"{'#':>4}  {'timestamp':19}  {'models':3}  {'verdict':12}  {'cons?':6}  {'contra?':7}  {'faults':22}  {'integrity':9}  prompt")
+    print(f"{'─'*80}")
     for s in recent:
         parse = s.get("section_parse") or {}
         integrity = s.get("script_integrity") or {}
         run = s.get("run_number", "?")
         ts = s.get("timestamp", "")[:19]
         n_models = len(s.get("models", []))
-        verdict = parse.get("verification_verdict") or "—"
+        verdict = parse.get("verification_verdict") or "\u2014"
         consensus = "empty" if parse.get("consensus_empty") else "has"
         contra = "empty" if parse.get("contradictions_empty") else "has"
-        ok = "✓ ok" if integrity.get("integrity_ok") else "✗ FAIL"
-        prompt = s.get("prompt", "")[:30]
-        print(f"{run:>4}  {ts}  {n_models:>5}  {verdict:12}  {consensus:6}  {contra:7}  {ok:9}  {prompt}")
+        ok = "\u2713 ok" if integrity.get("integrity_ok") else "\u2717 FAIL"
+        prompt = s.get("prompt", "")[:25]
+        # Collect fault_verdicts from per-model phases
+        fault_parts = [
+            f"{p['model'].split('/')[-1][:8]}:{p.get('error','')[:12]}"
+            for p in s.get("phases", [])
+            if p.get("phase") == "per" and p.get("error")
+        ]
+        faults = "; ".join(fault_parts)[:22] if fault_parts else "\u2014"
+        print(f"{run:>4}  {ts}  {n_models:>5}  {verdict:12}  {consensus:6}  {contra:7}  {faults:22}  {ok:9}  {prompt}")
 
     # Trend analysis: is Contradictions getting emptier over time?
     if len(sessions) >= 3:
