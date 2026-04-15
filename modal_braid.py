@@ -37,14 +37,14 @@ session_dict = modal.Dict.from_name("braid-session", create_if_missing=True)
 
 ollama_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("curl")
+    .apt_install("curl", "zstd")
     .run_commands(
         "curl -fsSL https://ollama.ai/install.sh | sh",
     )
-    .pip_install("httpx", "asyncio")
+    .pip_install("httpx")
 )
 
-base_image = modal.Image.debian_slim(python_version="3.11").pip_install("httpx")
+base_image = modal.Image.debian_slim(python_version="3.11").pip_install("httpx", "fastapi[standard]")
 
 # ── Compliance validator (Python port of tool-validator.ts) ────────────────
 
@@ -196,16 +196,24 @@ def validate_output(tool: str, output: str, args: dict) -> dict:
     }
 
 
-# ── Audit helpers (run inside Modal containers) ────────────────────────────
+# ── Audit helpers ─────────────────────────────────────────────────────────
 
-def _write_audit(entry: dict, volume: modal.Volume = None):
-    """Append a JSONL entry to the audit volume. Safe to call from any container."""
+def _write_audit(entry: dict):
+    """Append a JSONL entry to the audit volume. Only call from inside a Modal container."""
     import os
     os.makedirs(AUDIT_MOUNT, exist_ok=True)
     with open(AUDIT_FILE, "a") as f:
         f.write(json.dumps(entry) + "\n")
-    if volume:
-        volume.commit()
+    audit_volume.commit()
+
+
+@app.function(
+    image=base_image,
+    volumes={AUDIT_MOUNT: audit_volume},
+)
+def write_audit_entry(entry: dict):
+    """Write a single audit entry to the persistent volume. Call via .remote() from local context."""
+    _write_audit(entry)
 
 
 # ── Model inference container ──────────────────────────────────────────────
@@ -278,7 +286,7 @@ def run_model(model: str, prompt: str, session_id: str, phase: str = "per") -> d
         "findings": validation.get("findings", []),
         "outputPreview": text[:200],
     }
-    _write_audit(entry, audit_volume)
+    _write_audit(entry)
 
     return {
         "model": model,
@@ -337,7 +345,7 @@ def verify_claim(body: dict) -> dict:
         "verdict": verdict,
         "reason": reason,
     }
-    _write_audit(entry, audit_volume)
+    _write_audit(entry)
 
     return {
         "verdict": verdict,
@@ -471,7 +479,7 @@ def main(
     verdict_body = verdict_match.group(1).strip()[:400] if verdict_match else ""
     is_fail = "fail" in verdict_body.lower()
 
-    # Write final session entry to audit
+    # Write final session entry to audit (via Modal container — Volume is read-only locally)
     final_entry = {
         "type": "session_complete",
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -481,7 +489,7 @@ def main(
         "verdict": "FAIL" if is_fail else "PASS",
         "verdict_body": verdict_body[:200],
     }
-    _write_audit(final_entry, audit_volume)
+    write_audit_entry.remote(final_entry)
 
     # ── Phase 0 refinement on FAIL ─────────────────────────────────────────
     if refine and is_fail:
