@@ -6,11 +6,15 @@ import {
 } from "../constraints.js";
 
 describe("CONSTRAINT_SETS", () => {
-  it("contains all four expected sets", () => {
+  it("contains all expected sets including regulatory frameworks", () => {
     const ids = CONSTRAINT_SETS.map((s) => s.id);
     expect(ids).toContain("tool-algebra");
     expect(ids).toContain("braille-bottleneck");
-    expect(ids).toContain("compliance");
+    expect(ids).toContain("fcra");
+    expect(ids).toContain("glba");
+    expect(ids).toContain("hipaa");
+    expect(ids).toContain("iso27001");
+    expect(ids).toContain("soc");
     expect(ids).toContain("verification");
   });
 
@@ -30,10 +34,13 @@ describe("CONSTRAINT_SETS", () => {
 });
 
 describe("DEFAULT_ACTIVE", () => {
-  it("includes all four constraint sets", () => {
+  it("includes all regulatory and core constraint sets", () => {
     expect(DEFAULT_ACTIVE).toContain("tool-algebra");
-    expect(DEFAULT_ACTIVE).toContain("braille-bottleneck");
-    expect(DEFAULT_ACTIVE).toContain("compliance");
+    expect(DEFAULT_ACTIVE).toContain("fcra");
+    expect(DEFAULT_ACTIVE).toContain("glba");
+    expect(DEFAULT_ACTIVE).toContain("hipaa");
+    expect(DEFAULT_ACTIVE).toContain("iso27001");
+    expect(DEFAULT_ACTIVE).toContain("soc");
     expect(DEFAULT_ACTIVE).toContain("verification");
   });
 
@@ -90,10 +97,28 @@ describe("getActiveConstraints", () => {
     expect(joined).toContain("braille-speculative");
   });
 
-  it("compliance rules cite regulatory references", () => {
-    const rules = getActiveConstraints(["compliance"]);
+  it("fcra rules cite section references", () => {
+    const rules = getActiveConstraints(["fcra"]);
     const joined = rules.join(" ");
-    expect(joined).toMatch(/FCRA|GLBA|HIPAA/);
+    expect(joined).toMatch(/FCRA §/);
+  });
+
+  it("hipaa rules cite CFR references", () => {
+    const rules = getActiveConstraints(["hipaa"]);
+    const joined = rules.join(" ");
+    expect(joined).toMatch(/§164/);
+  });
+
+  it("soc rules cite TSC criteria", () => {
+    const rules = getActiveConstraints(["soc"]);
+    const joined = rules.join(" ");
+    expect(joined).toMatch(/CC[0-9]/);
+  });
+
+  it("iso27001 rules cite annex A controls", () => {
+    const rules = getActiveConstraints(["iso27001"]);
+    const joined = rules.join(" ");
+    expect(joined).toMatch(/A\.[0-9]/);
   });
 
   it("verification rules reference verify_claim and audit_log", () => {

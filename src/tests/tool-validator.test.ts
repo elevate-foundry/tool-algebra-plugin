@@ -24,7 +24,7 @@ describe("validateToolOutput — error-not-diagnosed", () => {
     const r = validateToolOutput("bash", "Error: command not found", {});
     expect(r.verdict).toBe("flag");
     expect(r.reason).toMatch(/error/i);
-    expect(r.annotation).toContain("[VERIFIER]");
+    expect(r.annotation).toContain("[VERIFIER:FLAG]");
   });
 
   it("flags output containing 'Traceback'", () => {
@@ -47,7 +47,7 @@ describe("validateToolOutput — pii-exposure", () => {
   it("blocks SSN pattern", () => {
     const r = validateToolOutput("read_file", "SSN: 123-45-6789", {});
     expect(r.verdict).toBe("blocked");
-    expect(r.reason).toMatch(/PII/i);
+    expect(r.reason).toMatch(/sensitive data|SSN/i);
     expect(r.annotation).toContain("[VERIFIER:BLOCKED]");
   });
 
@@ -56,9 +56,10 @@ describe("validateToolOutput — pii-exposure", () => {
     expect(r.verdict).toBe("blocked");
   });
 
-  it("does not block phone numbers (not in pattern set)", () => {
+  it("blocks phone numbers (GLBA NPI expansion)", () => {
+    // Phone numbers are now blocked under GLBA §501 NPI taint expansion
     const r = validateToolOutput("read_file", "Call: 555-867-5309", {});
-    expect(r.verdict).toBe("pass");
+    expect(r.verdict).toBe("blocked");
   });
 });
 
@@ -123,5 +124,73 @@ describe("validateToolOutput — verdict priority", () => {
     const big = "SSN: 123-45-6789 " + "a".repeat(8001);
     const r = validateToolOutput("read_file", big, {});
     expect(r.verdict).toBe("blocked");
+  });
+
+  it("accumulates multiple findings", () => {
+    const r = validateToolOutput("read_file", "SSN: 123-45-6789 " + "a".repeat(8001), {});
+    expect(r.findings?.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("validateToolOutput — durable-write-gate", () => {
+  it("blocks write_file without justification", () => {
+    const r = validateToolOutput("write_file", "ok", {});
+    expect(r.verdict).toBe("blocked");
+    expect(r.reason).toMatch(/justification/i);
+  });
+
+  it("allows write_file with valid justification and regulatory_basis", () => {
+    const r = validateToolOutput("write_file", "ok", {
+      justification: "Logging session data for audit trail per SOC 2 PI1.1",
+      regulatory_basis: "SOC2-PI1.1",
+    });
+    expect(r.verdict).toBe("flag"); // allowed but logged
+    expect(r.reason).toMatch(/justification/i);
+  });
+
+  it("blocks bash with redirect without justification", () => {
+    const r = validateToolOutput("bash", "ok", { command: "echo data >> log.txt" });
+    expect(r.verdict).toBe("blocked");
+  });
+
+  it("passes safe bash (no write)", () => {
+    const r = validateToolOutput("bash", "hello", { command: "echo hello" });
+    expect(r.verdict).toBe("pass");
+  });
+});
+
+describe("validateToolOutput — deprecated-crypto", () => {
+  it("blocks MD5 reference", () => {
+    const r = validateToolOutput("bash", "hash = MD5(data)", {});
+    expect(r.verdict).toBe("blocked");
+    expect(r.reason).toMatch(/MD5/i);
+  });
+
+  it("blocks SHA-1 reference", () => {
+    const r = validateToolOutput("bash", "using SHA1 for signing", {});
+    expect(r.verdict).toBe("blocked");
+  });
+
+  it("passes SHA-256", () => {
+    const r = validateToolOutput("bash", "using SHA-256 for integrity", {});
+    expect(r.verdict).toBe("pass");
+  });
+});
+
+describe("validateToolOutput — hardcoded-credentials", () => {
+  it("blocks hardcoded password", () => {
+    const r = validateToolOutput("read_file", "password = 'hunter2'", {});
+    expect(r.verdict).toBe("blocked");
+    expect(r.reason).toMatch(/password/i);
+  });
+
+  it("blocks AWS key ID pattern", () => {
+    const r = validateToolOutput("bash", "AKIAIOSFODNN7EXAMPLE", {});
+    expect(r.verdict).toBe("blocked");
+  });
+
+  it("passes output without credentials", () => {
+    const r = validateToolOutput("bash", "Build succeeded in 2.3s", {});
+    expect(r.verdict).toBe("pass");
   });
 });

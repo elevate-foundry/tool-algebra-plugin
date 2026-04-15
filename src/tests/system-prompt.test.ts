@@ -10,7 +10,8 @@ function buildSystemPrompt(ids: string[]): string {
   const toolAlgebraRules = getActiveConstraints(["tool-algebra"]);
   const verificationRules = getActiveConstraints(["verification"]);
   const brailleRules = getActiveConstraints(["braille-bottleneck"]);
-  const complianceRules = getActiveConstraints(["compliance"]);
+  const regulatoryIds = ["fcra", "glba", "hipaa", "iso27001", "soc"];
+  const regulatoryRules = getActiveConstraints(regulatoryIds.filter((id) => ids.includes(id)));
 
   const sections: string[] = [
     "## Operating Framework: Tool Algebra (Barrett 2025)",
@@ -31,9 +32,9 @@ function buildSystemPrompt(ids: string[]): string {
     sections.push(...brailleRules.map((r) => `- ${r.replace(/^\[braille-bottleneck\] /, "")}`));
   }
 
-  if (ids.includes("compliance")) {
-    sections.push("", "### Compliance Constraints");
-    sections.push(...complianceRules.map((r) => `- ${r.replace(/^\[compliance\] /, "")}`));
+  if (regulatoryRules.length > 0) {
+    sections.push("", "### Regulatory Constraints");
+    sections.push(...regulatoryRules.map((r) => `- ${r}`));
   }
 
   return sections.join("\n").trim();
@@ -65,9 +66,9 @@ describe("system prompt structure", () => {
     expect(prompt).toContain("### Braille Tool Discipline");
   });
 
-  it("includes compliance section when compliance active", () => {
+  it("includes regulatory section when fcra/glba/hipaa/iso27001/soc active", () => {
     const prompt = buildSystemPrompt(DEFAULT_ACTIVE);
-    expect(prompt).toContain("### Compliance Constraints");
+    expect(prompt).toContain("### Regulatory Constraints");
   });
 
   it("does NOT include braille section when not in active set", () => {
@@ -75,17 +76,17 @@ describe("system prompt structure", () => {
     expect(prompt).not.toContain("### Braille Tool Discipline");
   });
 
-  it("does NOT include compliance section when not in active set", () => {
+  it("does NOT include regulatory section when not in active set", () => {
     const prompt = buildSystemPrompt(["tool-algebra", "verification"]);
-    expect(prompt).not.toContain("### Compliance Constraints");
+    expect(prompt).not.toContain("### Regulatory Constraints");
   });
 });
 
 describe("system prompt token budget", () => {
-  it("full prompt fits within 4096 characters with all sets active", () => {
+  it("full prompt fits within 24000 characters with all sets active", () => {
     const prompt = buildSystemPrompt(DEFAULT_ACTIVE);
-    // rough token estimate: 1 token ≈ 4 chars; 4096 chars ≈ 1024 tokens
-    expect(prompt.length).toBeLessThan(4096);
+    // 52 rules across 8 sets; ~3000 tokens — fits all model context windows
+    expect(prompt.length).toBeLessThan(24000);
   });
 
   it("full prompt is non-trivially long (at least 500 chars)", () => {
@@ -110,9 +111,9 @@ describe("system prompt content coverage", () => {
     expect(prompt).toContain("audit_log");
   });
 
-  it("mentions PII guardrail", () => {
+  it("mentions NPI or PHI guardrail from regulatory constraints", () => {
     const prompt = buildSystemPrompt(DEFAULT_ACTIVE);
-    expect(prompt).toMatch(/PII|personal.*info/i);
+    expect(prompt).toMatch(/NPI|PHI|PII|nonpublic personal/i);
   });
 
   it("contains Rule 110 reference in braille section", () => {
