@@ -17,6 +17,7 @@ Also computes:
 
 Usage:
   modal run correlation.py --models "qwen2.5:latest,llama3.2:latest,mistral:latest"
+  modal run correlation.py  # runs all 10 candidate models
   modal run correlation.py --models "..." --save-results
 """
 
@@ -278,6 +279,67 @@ def cohen_kappa(x: list[int], y: list[int]) -> float:
     return (p_agree - p_chance) / (1 - p_chance)
 
 
+def ensemble_catch_rate(miss_vectors: dict[str, list[int]], subset: tuple[str, ...]) -> float:
+    """
+    Actual catch rate for an N-model ensemble on the benchmark.
+    The ensemble catches a violation if ANY model in the subset catches it.
+    miss = 1 only if ALL models in the subset miss it.
+    Returns fraction of probes where at least one model caught it.
+    """
+    if not subset:
+        return 0.0
+    n_probes = len(next(iter(miss_vectors.values())))
+    caught = 0
+    for i in range(n_probes):
+        all_miss = all(miss_vectors[m][i] == 1 for m in subset)
+        if not all_miss:
+            caught += 1
+    return caught / n_probes
+
+
+def greedy_best_ensemble(
+    miss_vectors: dict[str, list[int]],
+    max_size: int | None = None,
+) -> list[dict]:
+    """
+    Build the optimal ensemble greedily:
+    At each step, add the model that maximally increases catch rate.
+    Returns ordered list of {size, model_added, catch_rate, marginal_gain}.
+    """
+    remaining = list(miss_vectors.keys())
+    chosen: list[str] = []
+    curve = []
+    max_size = max_size or len(remaining)
+
+    while remaining and len(chosen) < max_size:
+        best_model = None
+        best_rate = ensemble_catch_rate(miss_vectors, tuple(chosen)) if chosen else 0.0
+        best_candidate_rate = best_rate
+
+        for candidate in remaining:
+            rate = ensemble_catch_rate(miss_vectors, tuple(chosen + [candidate]))
+            if rate > best_candidate_rate:
+                best_candidate_rate = rate
+                best_model = candidate
+
+        if best_model is None:
+            # No improvement from any remaining model — all remaining are redundant
+            break
+
+        chosen.append(best_model)
+        remaining.remove(best_model)
+        marginal = best_candidate_rate - best_rate
+        curve.append({
+            "size": len(chosen),
+            "model_added": best_model,
+            "ensemble": list(chosen),
+            "catch_rate": round(best_candidate_rate, 4),
+            "marginal_gain": round(marginal, 4),
+        })
+
+    return curve
+
+
 def independence_test(miss_a: list[int], miss_b: list[int]) -> dict:
     """
     Compare actual joint miss rate P(A∩B) to independence assumption P(A)·P(B).
@@ -305,12 +367,27 @@ def independence_test(miss_a: list[int], miss_b: list[int]) -> dict:
 
 # ── Local entrypoint ───────────────────────────────────────────────────────
 
+# All candidate models — architecturally diverse, skipping custom fine-tunes
+CANDIDATE_MODELS = [
+    "qwen2.5:latest",
+    "qwen2:7b",
+    "llama3.2:latest",
+    "llama2:latest",
+    "mistral:latest",
+    "gemma3:4b",
+    "phi3.5:latest",
+    "distilled-phi3.5:latest",
+    "deepseek-r1:latest",
+    "granite3-dense:8b",
+]
+
+
 @app.local_entrypoint()
 def main(
-    models: str = "qwen2.5:latest,llama3.2:latest,mistral:latest",
+    models: str = "",
     save_results: bool = False,
 ):
-    model_list = [m.strip() for m in models.split(",")]
+    model_list = [m.strip() for m in models.split(",")] if models else CANDIDATE_MODELS
     width = 72
 
     print(f"\n{'═'*width}")
@@ -394,8 +471,66 @@ def main(
         print(f"    independence ratio    = {indep['independence_ratio']:.2f}x  → {indep['note']}")
         print()
 
-    # Ensemble gain estimate
-    print(f"── Ensemble gain (2-model) ──\n")
+    # ── Greedy optimal ensemble + diminishing returns curve ──────────────────
+    print(f"\n── Optimal ensemble (greedy, by measured catch rate) ──\n")
+
+    curve = greedy_best_ensemble(miss_vectors)
+
+    prev_rate = 0.0
+    print(f"  {'N':>3}  {'Model added':30s}  {'Catch rate':>12}  {'Marginal gain':>14}  {'Diminishing?'}")
+    print(f"  {'─'*3}  {'─'*30}  {'─'*12}  {'─'*14}  {'─'*12}")
+    for step in curve:
+        n = step["size"]
+        marginal = step["marginal_gain"]
+        prev_marginal = curve[n - 2]["marginal_gain"] if n >= 2 else marginal
+        diminishing = "◀ plateau" if marginal < 0.05 else ("↘ slowing" if marginal < prev_marginal * 0.6 else "")
+        bar = "█" * int(step["catch_rate"] * 20)
+        print(
+            f"  {n:>3}  {step['model_added']:30s}  "
+            f"{step['catch_rate']:>11.1%}  "
+            f"{marginal:>+13.1%}  "
+            f"{diminishing}"
+        )
+        print(f"       {bar}")
+        prev_rate = step["catch_rate"]
+
+    if curve:
+        best = curve[-1]
+        knee = next((s for s in curve if s["marginal_gain"] < 0.05), None)
+        print(f"\n  Ceiling:          {best['catch_rate']:.1%} at {best['size']} models")
+        if knee:
+            print(f"  Diminishing returns at N={knee['size']} (marginal gain < 5%)")
+            print(f"  Recommended ensemble: {curve[knee['size']-2]['ensemble']}")
+        else:
+            print(f"  No plateau reached — all models add meaningful signal")
+
+    # Best N=2 pair by measured catch rate
+    print(f"\n── Best subsets by size (exhaustive search up to N=4) ──\n")
+    for size in range(2, min(5, len(model_list) + 1)):
+        best_subset = None
+        best_rate = -1.0
+        for subset in itertools.combinations(model_list, size):
+            rate = ensemble_catch_rate(miss_vectors, subset)
+            if rate > best_rate:
+                best_rate = rate
+                best_subset = subset
+        # also find worst for contrast
+        worst_subset = None
+        worst_rate = 2.0
+        for subset in itertools.combinations(model_list, size):
+            rate = ensemble_catch_rate(miss_vectors, subset)
+            if rate < worst_rate:
+                worst_rate = rate
+                worst_subset = subset
+        print(f"  N={size}")
+        print(f"    Best:  {list(best_subset)}")
+        print(f"           catch rate = {best_rate:.1%}")
+        print(f"    Worst: {list(worst_subset)}")
+        print(f"           catch rate = {worst_rate:.1%}")
+        print()
+
+    # Ensemble gain estimate (2-model pairs only — keep output manageable)
+    print(f"── Pairwise ensemble gain ──\n")
     for m_a, m_b in pairs:
         stats = pair_stats[(m_a, m_b)]
         p_a = stats["independence"]["p_miss_A"]
@@ -403,15 +538,9 @@ def main(
         p_joint_actual = stats["independence"]["p_joint_actual"]
         p_joint_assumed = p_a * p_b
 
-        gain_assumed = (1 - p_a) + p_b * p_a  # independent assumption
-        gain_actual  = 1 - p_joint_actual        # measured
-
-        print(f"  {m_a} + {m_b}")
-        print(f"    Gain (independence assumed): {gain_assumed:.1%} catch rate")
-        print(f"    Gain (measured):             {gain_actual:.1%} catch rate")
+        gain_actual = 1 - p_joint_actual
         overhead = (p_joint_actual - p_joint_assumed) / max(p_joint_assumed, 1e-9)
-        print(f"    Correlation overhead:        {overhead:+.1%}  (how much independence overstates gain)")
-        print()
+        print(f"  {m_a:28s} + {m_b:28s}  catch={gain_actual:.1%}  overhead={overhead:+.1%}")
 
     # Save to audit volume
     if save_results:
@@ -420,6 +549,7 @@ def main(
             "models": model_list,
             "benchmark_size": len(BENCHMARK),
             "miss_vectors": miss_vectors,
+            "optimal_curve": curve,
             "pair_stats": {
                 f"{a}×{b}": {
                     "rho": round(v["rho"], 4),
@@ -429,7 +559,6 @@ def main(
                 for (a, b), v in pair_stats.items()
             },
         }
-        # Write via Modal container (Volume read-only locally)
         _save_correlation.remote(output)
         print(f"  Results saved to audit volume: correlation-results.jsonl")
 
