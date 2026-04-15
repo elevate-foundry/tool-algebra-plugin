@@ -26,6 +26,7 @@ Usage:
 """
 
 import argparse
+import ast
 import asyncio
 import json
 import os
@@ -156,6 +157,61 @@ def _print_response(r: ModelResponse, label: str = "") -> None:
     print(f"└{'─'*58}")
 
 
+def _build_context() -> str:
+    """
+    Reads the real source files and returns a concise architectural context block.
+    Injected into every phase prompt so models operate on ground truth, not hallucination.
+    """
+    repo = os.path.dirname(os.path.abspath(__file__))
+    sections = []
+
+    # braid.py — the engine itself (key sections only, not full source)
+    try:
+        src = open(os.path.join(repo, "braid.py")).read()
+        # Extract function signatures + docstrings as a skeleton
+        tree = ast.parse(src)
+        sigs = []
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = [a.arg for a in node.args.args]
+                doc = ast.get_docstring(node) or ""
+                sigs.append(f"  {'async ' if isinstance(node, ast.AsyncFunctionDef) else ''}def {node.name}({', '.join(args)}){': ' + doc[:80] if doc else ''}")
+        sections.append("### braid.py — function signatures\n" + "\n".join(sigs))
+    except Exception as e:
+        sections.append(f"### braid.py — could not parse: {e}")
+
+    # braid_log.py — invariants list (what is being protected)
+    try:
+        log_src = open(os.path.join(repo, "braid_log.py")).read()
+        # Extract INVARIANT_SECTIONS list
+        m = re.search(r'INVARIANT_SECTIONS = \[(.+?)\]', log_src, re.DOTALL)
+        if m:
+            sections.append("### braid_log.py — structural invariants protected by integrity guard\n" + m.group(0))
+    except Exception:
+        pass
+
+    # src/index.ts — plugin hooks (what the verifier plugin actually does)
+    try:
+        plugin_src = open(os.path.join(repo, "src", "index.ts")).read()
+        sections.append("### src/index.ts (verifier plugin) — first 60 lines\n" + "\n".join(plugin_src.splitlines()[:60]))
+    except Exception:
+        pass
+
+    # src/constraints.ts — active constraint sets
+    try:
+        constraints_src = open(os.path.join(repo, "src", "constraints.ts")).read()
+        sections.append("### src/constraints.ts — constraint sets\n" + "\n".join(constraints_src.splitlines()[:40]))
+    except Exception:
+        pass
+
+    return (
+        "## Braid Engine — Architectural Context\n"
+        "You are running inside this system. The following is the real source code.\n"
+        "Do not invent function names, file names, or data structures not present here.\n\n"
+        + "\n\n".join(sections)
+    )
+
+
 async def braid(
     prompt: str,
     models: list[str],
@@ -178,13 +234,15 @@ async def braid(
     # Seal the plan. The synthesizer declares what it's about to do before any
     # model queries run. This is Γ — the immutable intent record.
     print("── PHASE 0: PRE (sealing plan) " + "─"*(width-31))
+    arch_context = _build_context()
     pre_prompt = (
         f"INSTRUCTION: Respond with plain text only. Do not call any tools. Do not use browser or filesystem tools.\n\n"
-        f"You are about to coordinate a multi-model query. "
+        f"{arch_context}\n\n"
+        f"You are about to coordinate a multi-model query on this system. "
         f"The user's question is: \"{prompt}\"\n\n"
         f"The following models will each independently answer it: {', '.join(models)}.\n\n"
         f"Before they run, state in 2-3 sentences: "
-        f"(1) what a good answer to this question looks like, "
+        f"(1) what a good answer to this question looks like given the actual codebase above, "
         f"(2) what disagreements you expect between models, "
         f"(3) what you will use as the verification criterion for the final synthesis. "
         f"Be specific. This is your sealed plan (Γ) — you cannot revise it later. "
@@ -202,7 +260,7 @@ async def braid(
 
     # ── PHASE 1: PER (parallel) ───────────────────────────────────────────────
     # Prepend no-tool instruction so models answer directly without spiraling into MCP tools
-    per_prompt = f"INSTRUCTION: Answer with plain text only. Do not call any tools.\n\n{prompt}"
+    per_prompt = f"INSTRUCTION: Answer with plain text only. Do not call any tools.\n\n{arch_context}\n\n{prompt}"
     pool = [m for m in models if m != synthesizer] if no_synth_in_pool else models
     if no_synth_in_pool and synthesizer in models:
         print(f"  [bias guard] excluded {synthesizer} from pool — it synthesizes but doesn't vote")
