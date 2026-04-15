@@ -10,7 +10,13 @@ Architecture:
 
 Usage:
   modal run modal_braid.py --question "..." [--models m1,m2] [--refine]
-  modal deploy modal_braid.py   # expose web endpoints permanently
+  modal deploy modal_braid.py   # expose web endpoints + UI permanently
+
+Endpoints (after deploy):
+  GET  /              → streaming UI
+  POST /braid/stream  → SSE stream (phases emitted as they complete)
+  POST /verify_claim  → claim verification
+  GET  /audit_log     → audit history
 
 Roles (product-of-experts, engineered independence):
   advocate  — argue for the most correct answer, cite reasoning
@@ -373,6 +379,347 @@ def run_model(model: str, prompt: str, session_id: str, phase: str = "per") -> d
 def run_synthesizer(model: str, prompt: str, session_id: str, phase: str = "post") -> dict:
     """Synthesis and verification — same infra as run_model but labeled separately."""
     return run_model.local(model, prompt, session_id, phase)
+
+
+# ── SSE helper ───────────────────────────────────────────────────────────
+
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+# ── Static UI ─────────────────────────────────────────────────────────────
+
+UI_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Braid Engine</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0d0d0d; color: #e0e0e0; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 13px; min-height: 100vh; }
+  header { padding: 18px 24px; border-bottom: 1px solid #222; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 15px; letter-spacing: 0.08em; color: #fff; font-weight: 600; }
+  header span { color: #555; font-size: 11px; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  .input-row { display: flex; gap: 10px; margin-bottom: 28px; }
+  input[type=text] { flex: 1; background: #161616; border: 1px solid #2a2a2a; border-radius: 6px; color: #e0e0e0; padding: 10px 14px; font-family: inherit; font-size: 13px; outline: none; transition: border 0.15s; }
+  input[type=text]:focus { border-color: #444; }
+  button { background: #1a1a1a; border: 1px solid #333; border-radius: 6px; color: #ccc; padding: 10px 20px; font-family: inherit; font-size: 13px; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+  button:hover { background: #222; border-color: #555; color: #fff; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .phase { margin-bottom: 20px; }
+  .phase-header { font-size: 11px; letter-spacing: 0.12em; color: #555; text-transform: uppercase; margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px solid #1a1a1a; }
+  .sealed-plan { background: #111; border: 1px solid #1e1e1e; border-left: 3px solid #3a3a3a; border-radius: 4px; padding: 14px 16px; white-space: pre-wrap; line-height: 1.6; color: #aaa; }
+  .roles { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+  .role-card { background: #111; border: 1px solid #1e1e1e; border-radius: 6px; overflow: hidden; }
+  .role-card.advocate { border-top: 2px solid #2d6a4f; }
+  .role-card.adversary { border-top: 2px solid #6a2d2d; }
+  .role-card.auditor   { border-top: 2px solid #2d4a6a; }
+  .role-label { padding: 8px 14px; font-size: 11px; letter-spacing: 0.1em; display: flex; justify-content: space-between; align-items: center; }
+  .role-label .symbol { font-size: 15px; }
+  .role-label .meta { color: #444; font-size: 10px; }
+  .role-body { padding: 12px 14px; color: #bbb; white-space: pre-wrap; line-height: 1.6; min-height: 60px; }
+  .verdict-pass { color: #4ade80; font-size: 10px; font-weight: 700; letter-spacing: 0.1em; }
+  .verdict-flag { color: #facc15; font-size: 10px; font-weight: 700; }
+  .verdict-blocked { color: #f87171; font-size: 10px; font-weight: 700; }
+  .findings { margin-top: 8px; padding-top: 8px; border-top: 1px solid #1a1a1a; }
+  .finding { color: #facc15; font-size: 11px; margin-bottom: 3px; }
+  .synthesis { background: #0f1a0f; border: 1px solid #1e2e1e; border-radius: 6px; padding: 18px; white-space: pre-wrap; line-height: 1.7; color: #ccc; }
+  .synthesis h2 { color: #4ade80; font-size: 12px; letter-spacing: 0.08em; margin-bottom: 8px; margin-top: 16px; }
+  .synthesis h2:first-child { margin-top: 0; }
+  .verdict-banner { text-align: center; padding: 14px; border-radius: 6px; font-size: 14px; font-weight: 700; letter-spacing: 0.15em; margin-top: 18px; }
+  .verdict-banner.pass { background: #0f2a1a; color: #4ade80; border: 1px solid #1a4a2a; }
+  .verdict-banner.fail { background: #2a0f0f; color: #f87171; border: 1px solid #4a1a1a; }
+  .status { font-size: 11px; color: #555; margin-bottom: 16px; min-height: 18px; }
+  .spinner { display: inline-block; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .audit-link { font-size: 11px; color: #444; margin-top: 12px; }
+  .audit-link a { color: #666; text-decoration: none; }
+  .audit-link a:hover { color: #aaa; }
+  .placeholder { color: #333; font-style: italic; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>&#9135; Braid Engine</h1>
+  <span>Advocate &oplus; &nbsp; Adversary &ominus; &nbsp; Auditor &otimes;</span>
+</header>
+<div class="container">
+  <div class="input-row">
+    <input type="text" id="question" placeholder="Ask a question..." />
+    <button id="run-btn" onclick="runBraid()">Run Braid</button>
+  </div>
+  <div class="status" id="status"></div>
+
+  <div class="phase" id="phase-pre" style="display:none">
+    <div class="phase-header">&Gamma; Sealed Plan</div>
+    <div class="sealed-plan" id="sealed-plan-text"></div>
+  </div>
+
+  <div class="phase" id="phase-per" style="display:none">
+    <div class="phase-header">Phase 1 &mdash; Roles (parallel)</div>
+    <div class="roles" id="roles-grid"></div>
+  </div>
+
+  <div class="phase" id="phase-post" style="display:none">
+    <div class="phase-header">Phase 2 &mdash; Synthesis</div>
+    <div class="synthesis" id="synthesis-text"></div>
+    <div id="verdict-banner"></div>
+  </div>
+
+  <div class="audit-link" id="audit-link"></div>
+</div>
+<script>
+const ROLE_CLASSES = { advocate: 'advocate', adversary: 'adversary', auditor: 'auditor' };
+const ROLE_LABELS  = { advocate: '\u2295 Advocate', adversary: '\u2296 Adversary', auditor: '\u2297 Auditor' };
+
+function setStatus(msg, spin=false) {
+  document.getElementById('status').innerHTML =
+    (spin ? '<span class="spinner">&#8635;</span> ' : '') + msg;
+}
+
+function show(id) { document.getElementById(id).style.display = ''; }
+
+function renderMarkdown(text) {
+  return text
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+}
+
+function addRoleCard(data) {
+  const grid = document.getElementById('roles-grid');
+  const role = data.role || 'advocate';
+  const verdict = data.verdict || 'pass';
+  const latency = data.latency_ms ? (data.latency_ms/1000).toFixed(1)+'s' : '';
+  const findings = (data.findings || []).map(f =>
+    `<div class="finding">&bull; [${f.rule}] ${f.reason}</div>`
+  ).join('');
+  const card = document.createElement('div');
+  card.className = `role-card ${ROLE_CLASSES[role] || ''}`;
+  card.id = `role-${role}`;
+  card.innerHTML = `
+    <div class="role-label">
+      <span>${ROLE_LABELS[role] || role} <span style="color:#444">[${data.model || ''}]</span></span>
+      <span class="meta">${latency} &nbsp; <span class="verdict-${verdict}">${verdict.toUpperCase()}</span></span>
+    </div>
+    <div class="role-body">${(data.text || '').slice(0,600)}${(data.text||'').length>600?'...':''}
+      ${findings ? '<div class="findings">'+findings+'</div>' : ''}
+    </div>`;
+  grid.appendChild(card);
+}
+
+async function runBraid() {
+  const question = document.getElementById('question').value.trim();
+  if (!question) return;
+  document.getElementById('run-btn').disabled = true;
+  document.getElementById('roles-grid').innerHTML = '';
+  document.getElementById('synthesis-text').innerHTML = '<span class="placeholder">Waiting...</span>';
+  document.getElementById('verdict-banner').innerHTML = '';
+  document.getElementById('audit-link').innerHTML = '';
+  ['phase-pre','phase-per','phase-post'].forEach(id => document.getElementById(id).style.display='none');
+
+  setStatus('Sealing plan...', true);
+
+  const es = new EventSource('/braid/stream?question=' + encodeURIComponent(question));
+
+  es.addEventListener('pre_done', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('sealed-plan-text').textContent = d.sealed_plan || '';
+    show('phase-pre');
+    setStatus('Running ' + (d.n_roles||3) + ' roles in parallel...', true);
+  });
+
+  es.addEventListener('per_model_done', e => {
+    const d = JSON.parse(e.data);
+    show('phase-per');
+    addRoleCard(d);
+  });
+
+  es.addEventListener('post_done', e => {
+    const d = JSON.parse(e.data);
+    const text = d.synthesis || '';
+    document.getElementById('synthesis-text').innerHTML = renderMarkdown(text);
+    const isPass = text.toLowerCase().includes('pass') && !text.toLowerCase().includes('fail');
+    const banner = document.getElementById('verdict-banner');
+    banner.className = 'verdict-banner ' + (isPass ? 'pass' : 'fail');
+    banner.textContent = isPass ? 'VERIFICATION: PASS' : 'VERIFICATION: FAIL';
+    show('phase-post');
+    setStatus('Synthesis complete.', false);
+  });
+
+  es.addEventListener('session_complete', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('audit-link').innerHTML =
+      `Session <code>${d.session_id}</code> &mdash; <a href="/audit_log?last_n=5">View audit log</a>`;
+    document.getElementById('run-btn').disabled = false;
+    es.close();
+    setStatus('');
+  });
+
+  es.onerror = () => {
+    setStatus('Stream error or complete.');
+    document.getElementById('run-btn').disabled = false;
+    es.close();
+  };
+}
+
+document.getElementById('question').addEventListener('keydown', e => {
+  if (e.key === 'Enter') runBraid();
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.function(image=base_image)
+@modal.fastapi_endpoint(method="GET")
+def ui() -> "fastapi.responses.HTMLResponse":
+    """Serve the braid streaming UI."""
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(UI_HTML)
+
+
+# ── Streaming braid endpoint ───────────────────────────────────────────────
+
+@app.function(
+    image=base_image,
+    timeout=600,
+)
+@modal.fastapi_endpoint(method="GET")
+def braid_stream(
+    question: str,
+    models: str = "qwen2.5:latest,llama3.2:latest,mistral:latest",
+    synthesizer: str = "qwen2.5:latest",
+) -> "fastapi.responses.StreamingResponse":
+    """
+    SSE stream for a full braid run. Connect with EventSource('/braid/stream?question=...').
+    Emits: pre_done, per_model_done (×N), post_done, session_complete
+    """
+    from fastapi.responses import StreamingResponse
+
+    model_list = [m.strip() for m in models.split(",")]
+    assignments = _assign_roles(model_list)
+    session_id = str(uuid.uuid4())[:8]
+
+    def generate():
+        # ── PRE ──────────────────────────────────────────────────────────
+        role_descriptions = "\n".join(
+            f"  {a['symbol']} {a['label']} ({a['model']}): {ROLES[a['role']]['description']}"
+            for a in assignments
+        )
+        pre_prompt = (
+            f"INSTRUCTION: Respond with plain text only. Do not call any tools.\n\n"
+            f"You are about to coordinate a structured multi-role query. "
+            f"The user's question is: \"{question}\"\n\n"
+            f"The following roles will each independently address it:\n{role_descriptions}\n\n"
+            f"Before they run, state in 2-3 sentences: "
+            f"(1) what a correct answer looks like, "
+            f"(2) what tensions you expect between roles, "
+            f"(3) what verification criterion you will use — be explicit about what would cause FAIL. "
+            f"This is your sealed plan (Γ) — you cannot revise it later."
+        )
+        pre_result = run_model.remote(synthesizer, pre_prompt, session_id, "pre")
+        sealed_plan = pre_result.get("text", "(no plan)")
+        session_dict[f"{session_id}:sealed_plan"] = sealed_plan
+
+        yield _sse("pre_done", {
+            "sealed_plan": sealed_plan,
+            "session_id": session_id,
+            "n_roles": len(assignments),
+            "latency_ms": pre_result.get("latency_ms", 0),
+        })
+
+        # ── PER (parallel) ────────────────────────────────────────────────
+        per_futures = [
+            run_model.spawn(
+                a["model"],
+                (
+                    f"{a['frame']}\n\n"
+                    f"SEALED PLAN (Γ): {sealed_plan}\n\n"
+                    f"Question: {question}\n\n"
+                    f"Respond in character as the {a['label']}. Be specific."
+                ),
+                session_id,
+                f"per:{a['role']}",
+            )
+            for a in assignments
+        ]
+
+        # Emit each role result as it completes
+        for future, assignment in zip(per_futures, assignments):
+            r = future.get()
+            session_dict[f"{session_id}:per:{assignment['role']}"] = r.get("text", "")
+            yield _sse("per_model_done", {
+                "role": assignment["role"],
+                "role_label": assignment["label"],
+                "symbol": assignment["symbol"],
+                "model": assignment["model"],
+                "text": (r.get("text") or "")[:800],
+                "verdict": r.get("fault_verdict", "pass"),
+                "findings": r.get("findings", []),
+                "latency_ms": r.get("latency_ms", 0),
+            })
+
+        # ── POST ──────────────────────────────────────────────────────────
+        # Collect all responses from session_dict
+        per_texts = [
+            (a["symbol"] + a["label"] + f" / {a['model']}",
+             session_dict.get(f"{session_id}:per:{a['role']}", ""))
+            for a in assignments
+        ]
+        response_block = "\n\n".join(f"[{label}]:\n{text[:400]}" for label, text in per_texts if text)
+
+        post_prompt = (
+            f"SEALED PLAN (Γ): {sealed_plan}\n\n"
+            f"QUESTION: {question}\n\n"
+            f"ROLE RESPONSES:\n{response_block}\n\n"
+            f"## Synthesized Answer\n[Reconcile the Advocate, Adversary, and Auditor]\n\n"
+            f"## Role Tensions\n[Sharpest disagreements]\n\n"
+            f"## Audit Flags\n[Compliance violations found]\n\n"
+            f"## Verification\n[PASS or FAIL with reason, judged against Γ]"
+        )
+        post_result = run_synthesizer.remote(synthesizer, post_prompt, session_id, "post")
+        synthesis = post_result.get("text", "")
+
+        verdict_match = re.search(r"## Verification\s*\n(.+?)(?:\n##|$)", synthesis, re.DOTALL)
+        verdict_body = verdict_match.group(1).strip()[:400] if verdict_match else ""
+        is_fail = "fail" in verdict_body.lower()
+
+        yield _sse("post_done", {
+            "synthesis": synthesis,
+            "verdict": "FAIL" if is_fail else "PASS",
+            "verdict_body": verdict_body[:200],
+            "latency_ms": post_result.get("latency_ms", 0),
+        })
+
+        # Audit
+        write_audit_entry.remote({
+            "type": "session_complete",
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "sessionID": session_id,
+            "question": question[:100],
+            "roles": [{"model": a["model"], "role": a["role"]} for a in assignments],
+            "verdict": "FAIL" if is_fail else "PASS",
+            "verdict_body": verdict_body[:200],
+            "source": "stream",
+        })
+
+        yield _sse("session_complete", {
+            "session_id": session_id,
+            "verdict": "FAIL" if is_fail else "PASS",
+        })
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ── Web endpoints: verify_claim and audit_log ──────────────────────────────
