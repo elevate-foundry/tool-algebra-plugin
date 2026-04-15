@@ -183,15 +183,73 @@ SYSTEM_PROMPT = (
 )
 
 
-# ── Model runner (reuses ollama_image) ────────────────────────────────────
+# ── Model runners ────────────────────────────────────────────────────────────────
+# Routing: openrouter/* → OpenRouter API (CPU, no GPU, cheap)
+#          everything else → Ollama on T4 GPU
+
+openrouter_image = modal.Image.debian_slim(python_version="3.11").pip_install("httpx")
+
+OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+OPENROUTER_PREFIX = "openrouter/"
+
+
+@app.function(
+    image=openrouter_image,
+    timeout=120,
+    secrets=[modal.Secret.from_name("openrouter-key", required=False)],
+)
+def probe_openrouter(model: str, prompt: str) -> dict:
+    """
+    Probe an OpenRouter model via the OpenAI-compatible API.
+    model should be the part after 'openrouter/' e.g. 'openai/gpt-4o-mini'
+    Requires Modal Secret 'openrouter-key' with OPENROUTER_API_KEY set.
+    """
+    import httpx
+    import os
+
+    start = time.monotonic()
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key:
+        return {"model": model, "text": "ERROR: OPENROUTER_API_KEY not set",
+                "latency_ms": 0}
+
+    or_model = model.removeprefix(OPENROUTER_PREFIX)
+    try:
+        resp = httpx.post(
+            f"{OPENROUTER_BASE}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "HTTP-Referer": "https://github.com/elevate-foundry/tool-algebra-plugin",
+                "X-Title": "braid-correlation",
+            },
+            json={
+                "model": or_model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+            },
+            timeout=90,
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        text = f"ERROR: {e}"
+
+    return {
+        "model": model,
+        "text": text,
+        "latency_ms": int((time.monotonic() - start) * 1000),
+    }
+
 
 @app.function(
     image=ollama_image,
     gpu="T4",
     timeout=300,
 )
-def probe_model(model: str, prompt: str) -> dict:
-    """Run a single compliance probe on a model. Returns raw text response."""
+def probe_ollama(model: str, prompt: str) -> dict:
+    """Run a single compliance probe on a local Ollama model."""
     import subprocess
     import httpx
 
@@ -233,6 +291,13 @@ def probe_model(model: str, prompt: str) -> dict:
         "text": text,
         "latency_ms": int((time.monotonic() - start) * 1000),
     }
+
+
+def _spawn_probe(model: str, prompt: str):
+    """Route to the right probe function based on model prefix."""
+    if model.startswith(OPENROUTER_PREFIX):
+        return probe_openrouter.spawn(model, prompt)
+    return probe_ollama.spawn(model, prompt)
 
 
 # ── Scoring ────────────────────────────────────────────────────────────────
@@ -368,6 +433,7 @@ def independence_test(miss_a: list[int], miss_b: list[int]) -> dict:
 # ── Local entrypoint ───────────────────────────────────────────────────────
 
 # All candidate models — architecturally diverse, skipping custom fine-tunes
+# Prefix "openrouter/" routes to OpenRouter API instead of local Ollama
 CANDIDATE_MODELS = [
     "qwen2.5:latest",
     "qwen2:7b",
@@ -377,8 +443,10 @@ CANDIDATE_MODELS = [
     "gemma3:4b",
     "phi3.5:latest",
     "distilled-phi3.5:latest",
-    "deepseek-r1:latest",
+    "deepseek-r1:latest",          # CoT — expect different correlation profile
     "granite3-dense:8b",
+    "openrouter/openai/gpt-4o-mini",  # frontier baseline
+    "openrouter/deepseek/deepseek-r1",  # CoT via API (vs local deepseek-r1)
 ]
 
 
@@ -402,7 +470,7 @@ def main(
     for model in model_list:
         for item in BENCHMARK:
             key = (model, item["id"])
-            futures[key] = probe_model.spawn(model, item["prompt"])
+            futures[key] = _spawn_probe(model, item["prompt"])
 
     # Collect results
     results: dict[str, dict[str, dict]] = {m: {} for m in model_list}
