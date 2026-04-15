@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+braid.py — Multi-model consensus engine routed through opencode.
+
+Every call goes through `opencode run --format json` so the verifier plugin
+fires on each one: system prompt injection, tool output interception, audit log.
+
+Three phases per braid:
+
+  PHASE 0 — PRE (1 call, synthesizer model)
+    Seals the plan: declares intent, expected output shape, which models will run.
+    This is Γ in Tool Algebra — the immutable plan before execution begins.
+
+  PHASE 1 — PER (N parallel calls, one per model)
+    Each model gets the same prompt through opencode. Plugin constraints active.
+    Responses streamed, text extracted from JSON event stream.
+
+  PHASE 2 — POST (1 call, synthesizer model)
+    Sees all N responses. Produces braided output: ✓ consensus, ~ partial, ✗ contradiction.
+    Instructed to call verify_claim before signing off.
+
+Usage:
+    python3 braid.py "what is the most important property of a tool algebra?"
+    python3 braid.py --models qwen2.5:latest llama3.2:latest gemma3:4b
+    python3 braid.py --synthesizer deepseek-r1:latest --verbose "explain Rule 110"
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+DEFAULT_MODELS = [
+    "ollama/qwen2.5:latest",
+    "ollama/llama3.2:latest",
+    "ollama/gemma3:4b",
+]
+DEFAULT_SYNTHESIZER = "ollama/qwen2.5:latest"
+
+# Directory opencode reads config from (where opencode.jsonc + plugin are registered)
+OPENCODE_CWD = os.path.expanduser("~")
+
+
+@dataclass
+class ModelResponse:
+    model: str
+    text: str
+    latency_ms: int = 0
+    tokens_out: int = 0
+    error: Optional[str] = None
+    events: list[dict] = field(default_factory=list)
+
+
+def _run_opencode_sync(model: str, prompt: str, timeout: int = 120, pure: bool = False) -> ModelResponse:
+    """
+    Runs: opencode run "<prompt>" --model <model> --format json
+    from OPENCODE_CWD so the plugin and config are loaded.
+    pure=True adds --pure to suppress MCP tools (prevents tool-spiral on simple queries).
+    Extracts text from the JSON event stream.
+    """
+    start = time.monotonic()
+    cmd = [
+        "opencode", "run", prompt,
+        "--model", model,
+        "--format", "json",
+    ]
+    if pure:
+        cmd.append("--pure")
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=OPENCODE_CWD,
+        )
+        raw = result.stdout.strip()
+        if not raw:
+            stderr_snippet = result.stderr[-300:] if result.stderr else "(no stderr)"
+            return ModelResponse(model=model, text="", error=f"no output. stderr: {stderr_snippet}")
+
+        events = []
+        text_parts = []
+        tokens_out = 0
+
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+                events.append(ev)
+                t = ev.get("type", "")
+                # text event: part.text
+                if t == "text":
+                    part = ev.get("part", {})
+                    text_parts.append(part.get("text", ""))
+                # step_finish carries token counts
+                elif t == "step_finish":
+                    part = ev.get("part", {})
+                    tokens_out += part.get("tokens", {}).get("output", 0)
+                elif t == "error":
+                    err = ev.get("error", {})
+                    return ModelResponse(
+                        model=model,
+                        text="",
+                        error=f"{err.get('name','error')}: {err.get('data',{}).get('message', str(err))}",
+                        events=events,
+                    )
+            except json.JSONDecodeError:
+                pass
+
+        text = "".join(text_parts).strip()
+        if not text:
+            return ModelResponse(model=model, text="", error="no text in event stream", events=events)
+
+        return ModelResponse(
+            model=model,
+            text=text,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            tokens_out=tokens_out,
+            events=events,
+        )
+
+    except subprocess.TimeoutExpired:
+        return ModelResponse(model=model, text="", error=f"timeout after {timeout}s")
+    except FileNotFoundError:
+        return ModelResponse(model=model, text="", error="opencode not found in PATH")
+    except Exception as e:
+        return ModelResponse(model=model, text="", error=str(e))
+
+
+async def run_opencode(model: str, prompt: str, timeout: int = 120, pure: bool = False) -> ModelResponse:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _run_opencode_sync, model, prompt, timeout, pure)
+
+
+def _print_response(r: ModelResponse, label: str = "") -> None:
+    tag = label or r.model
+    if r.error:
+        print(f"\n✗ {tag}: {r.error}", file=sys.stderr)
+        return
+    print(f"\n┌─ {tag}  ({r.latency_ms}ms, {r.tokens_out} tok)")
+    for line in r.text.splitlines():
+        print(f"│  {line}")
+    print(f"└{'─'*58}")
+
+
+async def braid(
+    prompt: str,
+    models: list[str],
+    synthesizer: str,
+    verbose: bool = False,
+    no_synth_in_pool: bool = False,
+) -> None:
+    width = 60
+    print(f"\n{'='*width}")
+    print(f"BRAID  |  pre → {len(models)}×parallel → post")
+    print(f"Models: {', '.join(models)}")
+    print(f"Synth:  {synthesizer}")
+    print(f"Prompt: {prompt[:width-8]}{'...' if len(prompt)>width-8 else ''}")
+    print(f"{'='*width}\n")
+
+    # ── PHASE 0: PRE ──────────────────────────────────────────────────────────
+    # Seal the plan. The synthesizer declares what it's about to do before any
+    # model queries run. This is Γ — the immutable intent record.
+    print("── PHASE 0: PRE (sealing plan) " + "─"*(width-31))
+    pre_prompt = (
+        f"INSTRUCTION: Respond with plain text only. Do not call any tools. Do not use browser or filesystem tools.\n\n"
+        f"You are about to coordinate a multi-model query. "
+        f"The user's question is: \"{prompt}\"\n\n"
+        f"The following models will each independently answer it: {', '.join(models)}.\n\n"
+        f"Before they run, state in 2-3 sentences: "
+        f"(1) what a good answer to this question looks like, "
+        f"(2) what disagreements you expect between models, "
+        f"(3) what you will use as the verification criterion for the final synthesis. "
+        f"Be specific. This is your sealed plan (Γ) — you cannot revise it later. "
+        f"Reply with plain text only."
+    )
+    pre = await run_opencode(synthesizer, pre_prompt)
+    _print_response(pre, label=f"PRE [{synthesizer}]")
+    if pre.error:
+        print("Pre-phase failed — continuing without sealed plan.", file=sys.stderr)
+        sealed_plan = "(no plan)"
+    else:
+        sealed_plan = pre.text
+
+    # ── PHASE 1: PER (parallel) ───────────────────────────────────────────────
+    # Prepend no-tool instruction so models answer directly without spiraling into MCP tools
+    per_prompt = f"INSTRUCTION: Answer with plain text only. Do not call any tools.\n\n{prompt}"
+    pool = [m for m in models if m != synthesizer] if no_synth_in_pool else models
+    if no_synth_in_pool and synthesizer in models:
+        print(f"  [bias guard] excluded {synthesizer} from pool — it synthesizes but doesn't vote")
+    print(f"\n── PHASE 1: PER ({len(pool)} models in parallel) " + "─"*(width-38-len(str(len(pool)))))
+    tasks = [run_opencode(m, per_prompt) for m in pool]
+    responses: list[ModelResponse] = await asyncio.gather(*tasks)
+
+    successful = [r for r in responses if not r.error]
+    failed = [r for r in responses if r.error]
+
+    for r in responses:
+        _print_response(r)
+
+    if not successful:
+        print("\nAll models failed — cannot synthesize.", file=sys.stderr)
+        return
+
+    # ── PHASE 2: POST (synthesis) ─────────────────────────────────────────────
+    print(f"\n── PHASE 2: POST (synthesis via {synthesizer}) " + "─"*(width-43-len(synthesizer)))
+
+    responses_block = "\n\n".join(
+        f"### {r.model}\n{r.text}" for r in successful
+    )
+    failed_note = (
+        f"\nNote: {len(failed)} model(s) failed to respond: {[r.model for r in failed]}."
+        if failed else ""
+    )
+
+    post_prompt = (
+        f"INSTRUCTION: Respond with plain text only. Do not call browser or filesystem tools.\n\n"
+        f"You are the synthesis agent for a multi-model braid.\n\n"
+        f"Your sealed plan from before the queries ran:\n{sealed_plan}\n\n"
+        f"Original question: {prompt}\n{failed_note}\n\n"
+        f"Model responses:\n\n{responses_block}\n\n"
+        f"Produce a BRAIDED synthesis:\n"
+        f"## Consensus (✓)\n[claims every responding model agreed on]\n\n"
+        f"## Partial agreement (~)\n[claims present in some responses only — note which models]\n\n"
+        f"## Contradictions (✗)\n[direct disagreements — quote both sides with model attribution]\n\n"
+        f"## Synthesized Answer\n"
+        f"[your best unified answer]\n\n"
+        f"Before finishing, call verify_claim to confirm your synthesis matches "
+        f"the verification criterion you stated in your sealed plan."
+    )
+
+    post = await run_opencode(synthesizer, post_prompt)
+    _print_response(post, label=f"POST [{synthesizer}]")
+
+    if not post.error:
+        print(f"\n{'═'*width}")
+        print("BRAIDED OUTPUT")
+        print(f"{'═'*width}")
+        print(post.text)
+        print(f"{'═'*width}\n")
+
+    if verbose:
+        print(f"Total model responses: {len(successful)}/{len(models)}")
+        print(f"Audit log: ~/.local/share/opencode/verifier-audit.jsonl")
+        # show last few audit entries
+        audit_path = os.path.expanduser("~/.local/share/opencode/verifier-audit.jsonl")
+        if os.path.exists(audit_path):
+            with open(audit_path) as f:
+                lines = f.readlines()
+            recent = lines[-min(6, len(lines)):]
+            print(f"\nLast {len(recent)} audit entries:")
+            for line in recent:
+                try:
+                    e = json.loads(line)
+                    print(f"  {e.get('ts','')[:19]}  {e.get('type'):25s}  {e.get('verdict','') or e.get('claim','')[:40]}")
+                except Exception:
+                    pass
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Three-phase braid engine through opencode")
+    parser.add_argument("prompt", nargs="*", help="Prompt to braid")
+    parser.add_argument("--models", "-m", nargs="+", default=DEFAULT_MODELS)
+    parser.add_argument("--synthesizer", "-s", default=DEFAULT_SYNTHESIZER)
+    parser.add_argument("--no-synth-in-pool", action="store_true",
+                        help="Exclude synthesizer from Phase 1 pool to eliminate self-confirmation bias")
+    parser.add_argument("--verbose", "-v", action="store_true")
+    args = parser.parse_args()
+
+    prompt = " ".join(args.prompt) if args.prompt else None
+    if not prompt:
+        print('Usage: python3 braid.py "your question here"')
+        sys.exit(1)
+
+    asyncio.run(braid(
+        prompt=prompt,
+        models=args.models,
+        synthesizer=args.synthesizer,
+        verbose=args.verbose,
+        no_synth_in_pool=args.no_synth_in_pool,
+    ))
+
+
+if __name__ == "__main__":
+    main()
