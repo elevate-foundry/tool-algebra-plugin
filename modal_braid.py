@@ -102,6 +102,13 @@ AUDIT_FILE = f"{AUDIT_MOUNT}/verifier-audit.jsonl"
 # Per-session shared state: sealed plan, per-model outputs, verdicts
 session_dict = modal.Dict.from_name("braid-session", create_if_missing=True)
 
+# Daily usage + spend tracking
+usage_dict = modal.Dict.from_name("braid-usage", create_if_missing=True)
+
+# T4 GPU cost: $0.000164/sec. Typical run: 4 containers × avg 90s = ~$0.059
+GPU_COST_PER_SEC = 0.000164
+DAILY_REQUEST_CAP = 10
+
 # ── Container image ────────────────────────────────────────────────────────
 
 ollama_image = (
@@ -439,6 +446,10 @@ UI_HTML = """
   .audit-link a { color: #666; text-decoration: none; }
   .audit-link a:hover { color: #aaa; }
   .placeholder { color: #333; font-style: italic; font-size: 12px; }
+  .usage-bar { font-size: 11px; color: #333; margin-top: 28px; padding-top: 12px; border-top: 1px solid #161616; display: flex; gap: 20px; }
+  .usage-bar span { color: #444; }
+  .usage-bar .hi { color: #666; }
+  .error-banner { background: #2a0f0f; border: 1px solid #4a1a1a; border-radius: 6px; color: #f87171; padding: 14px 16px; margin-bottom: 16px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -470,6 +481,7 @@ UI_HTML = """
   </div>
 
   <div class="audit-link" id="audit-link"></div>
+  <div class="usage-bar" id="usage-bar"></div>
 </div>
 <script>
 const ROLE_CLASSES = { advocate: 'advocate', adversary: 'adversary', auditor: 'auditor' };
@@ -575,7 +587,28 @@ async function runBraid() {
   es.addEventListener('session_complete', e => {
     const d = JSON.parse(e.data);
     document.getElementById('audit-link').innerHTML =
-      `Session <code>${d.session_id}</code> &mdash; <a href="/audit_log?last_n=5">View audit log</a>`;
+      `Session <code>${d.session_id}</code> &mdash; <a href="/audit_log?last_n=5">audit log</a>`;
+    if (d.estimated_cost_usd !== undefined) {
+      document.getElementById('usage-bar').innerHTML =
+        `<span>This run: <span class="hi">~$${d.estimated_cost_usd.toFixed(4)}</span></span>` +
+        `<span>Today: <span class="hi">${d.requests_today}/${d.daily_limit}</span> requests</span>` +
+        `<span><a href="/usage" style="color:#444">full usage →</a></span>`;
+    }
+    clearTimer();
+    document.getElementById('run-btn').disabled = false;
+    es.close();
+    setStatus('');
+  });
+
+  es.addEventListener('cap_error', e => {
+    const d = JSON.parse(e.data);
+    const existing = document.getElementById('error-banner');
+    if (existing) existing.remove();
+    const banner = document.createElement('div');
+    banner.id = 'error-banner';
+    banner.className = 'error-banner';
+    banner.textContent = d.message || 'An error occurred.';
+    document.querySelector('.container').insertBefore(banner, document.getElementById('status').nextSibling);
     clearTimer();
     document.getElementById('run-btn').disabled = false;
     es.close();
@@ -632,7 +665,21 @@ def web():
         session_id = str(uuid.uuid4())[:8]
 
         def generate():
-            # Heartbeat thread — keeps SSE alive during GPU cold start
+            # ── Daily cap check ───────────────────────────────────────────
+            import datetime
+            today = datetime.date.today().isoformat()
+            day_key = f"daily:{today}"
+            count = usage_dict.get(day_key, 0)
+            if count >= DAILY_REQUEST_CAP:
+                yield _sse("cap_error", {
+                    "message": f"Daily limit of {DAILY_REQUEST_CAP} requests reached. Resets at midnight UTC.",
+                    "count": count,
+                    "limit": DAILY_REQUEST_CAP,
+                })
+                return
+            usage_dict[day_key] = count + 1
+
+            # ── Heartbeat thread — keeps SSE alive during GPU cold start ──
             import threading
             _stop = threading.Event()
             _queue: list[str] = []
@@ -726,6 +773,21 @@ def web():
                 "latency_ms": post_result.get("latency_ms", 0),
             })
 
+            # ── Track spend ───────────────────────────────────────────────
+            import datetime
+            total_latency_ms = (
+                pre_result.get("latency_ms", 0)
+                + sum(r.get("latency_ms", 0) for r in per_results.values() if isinstance(r, dict))
+                + post_result.get("latency_ms", 0)
+            )
+            gpu_seconds = total_latency_ms / 1000
+            run_cost = round(gpu_seconds * GPU_COST_PER_SEC, 5)
+            today = datetime.date.today().isoformat()
+            prev_spend = usage_dict.get(f"spend:{today}", 0.0)
+            usage_dict[f"spend:{today}"] = round(prev_spend + run_cost, 5)
+            prev_total = usage_dict.get("spend:total", 0.0)
+            usage_dict["spend:total"] = round(prev_total + run_cost, 5)
+
             write_audit_entry.remote({
                 "type": "session_complete",
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -733,11 +795,17 @@ def web():
                 "question": question[:100],
                 "roles": [{"model": a["model"], "role": a["role"]} for a in assignments],
                 "verdict": "FAIL" if is_fail else "PASS",
+                "gpu_seconds": round(gpu_seconds, 1),
+                "estimated_cost_usd": run_cost,
                 "source": "stream",
             })
+            today2 = datetime.date.today().isoformat()
             yield _sse("session_complete", {
                 "session_id": session_id,
                 "verdict": "FAIL" if is_fail else "PASS",
+                "estimated_cost_usd": run_cost,
+                "requests_today": usage_dict.get(f"daily:{today2}", 1),
+                "daily_limit": DAILY_REQUEST_CAP,
             })
 
         return StreamingResponse(
@@ -765,6 +833,31 @@ def web():
             "verdict": verdict, "reason": reason,
         })
         return {"verdict": verdict, "reason": reason, "claim": claim}
+
+    @api.get("/usage")
+    def usage_route():
+        import datetime
+        today = datetime.date.today().isoformat()
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        # Last 7 days
+        days = []
+        for i in range(7):
+            d = (datetime.date.today() - datetime.timedelta(days=i)).isoformat()
+            days.append({
+                "date": d,
+                "requests": usage_dict.get(f"daily:{d}", 0),
+                "spend_usd": usage_dict.get(f"spend:{d}", 0.0),
+            })
+        return {
+            "today": {
+                "requests": usage_dict.get(f"daily:{today}", 0),
+                "limit": DAILY_REQUEST_CAP,
+                "remaining": max(0, DAILY_REQUEST_CAP - usage_dict.get(f"daily:{today}", 0)),
+                "spend_usd": usage_dict.get(f"spend:{today}", 0.0),
+            },
+            "total_spend_usd": usage_dict.get("spend:total", 0.0),
+            "last_7_days": days,
+        }
 
     @api.get("/audit_log")
     def audit_log_route(last_n: int = 10):
