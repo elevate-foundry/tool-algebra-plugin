@@ -33,6 +33,9 @@ import re
 import subprocess
 import sys
 import time
+from braid_log import (
+    new_session, record_phase, finalize_session, print_history, BraidSession
+)
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -160,8 +163,11 @@ async def braid(
     no_synth_in_pool: bool = False,
 ) -> None:
     width = 60
+    wall_start = time.monotonic()
+    session = new_session(prompt, models, synthesizer, no_synth_in_pool)
+
     print(f"\n{'='*width}")
-    print(f"BRAID  |  pre → {len(models)}×parallel → post")
+    print(f"BRAID  |  pre → {len(models)}×parallel → post  [run #{session.run_number}]")
     print(f"Models: {', '.join(models)}")
     print(f"Synth:  {synthesizer}")
     print(f"Prompt: {prompt[:width-8]}{'...' if len(prompt)>width-8 else ''}")
@@ -185,6 +191,8 @@ async def braid(
     )
     pre = await run_opencode(synthesizer, pre_prompt)
     _print_response(pre, label=f"PRE [{synthesizer}]")
+    record_phase(session, "pre", synthesizer, pre_prompt, pre.text or "",
+                 pre.tokens_out, pre.latency_ms, pre.error)
     if pre.error:
         print("Pre-phase failed — continuing without sealed plan.", file=sys.stderr)
         sealed_plan = "(no plan)"
@@ -206,6 +214,8 @@ async def braid(
 
     for r in responses:
         _print_response(r)
+        record_phase(session, "per", r.model, per_prompt, r.text or "",
+                     r.tokens_out, r.latency_ms, r.error)
 
     if not successful:
         print("\nAll models failed — cannot synthesize.", file=sys.stderr)
@@ -250,9 +260,11 @@ async def braid(
 
     post = await run_opencode(synthesizer, post_prompt)
     _print_response(post, label=f"POST [{synthesizer}]")
+    record_phase(session, "post", synthesizer, post_prompt, post.text or "",
+                 post.tokens_out, post.latency_ms, post.error)
 
     if post.error:
-        pass
+        finalize_session(session, "", int((time.monotonic()-wall_start)*1000))
     else:
         # ── Parse and validate braided structure ─────────────────────────────
         required_sections = [
@@ -304,6 +316,8 @@ async def braid(
         print(post.text)
         print(f"{'═'*width}\n")
 
+        finalize_session(session, post.text, int((time.monotonic()-wall_start)*1000))
+
     if verbose:
         print(f"Total model responses: {len(successful)}/{len(models)}")
         print(f"Audit log: ~/.local/share/opencode/verifier-audit.jsonl")
@@ -330,11 +344,18 @@ def main() -> None:
     parser.add_argument("--no-synth-in-pool", action="store_true",
                         help="Exclude synthesizer from Phase 1 pool to eliminate self-confirmation bias")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--history", action="store_true",
+                        help="Print session history and drift analysis, then exit")
     args = parser.parse_args()
+
+    if args.history:
+        print_history(20)
+        return
 
     prompt = " ".join(args.prompt) if args.prompt else None
     if not prompt:
         print('Usage: python3 braid.py "your question here"')
+        print('       python3 braid.py --history   # view session log + drift analysis')
         sys.exit(1)
 
     asyncio.run(braid(
