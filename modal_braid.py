@@ -11,6 +11,12 @@ Architecture:
 Usage:
   modal run modal_braid.py --question "..." [--models m1,m2] [--refine]
   modal deploy modal_braid.py   # expose web endpoints permanently
+
+Roles (product-of-experts, engineered independence):
+  advocate  — argue for the most correct answer, cite reasoning
+  adversary — find every flaw, edge case, and wrong assumption
+  auditor   — check compliance, legality, and constraint satisfaction
+  synthesis — reconcile all roles against the sealed plan (POST only)
 """
 
 import json
@@ -21,6 +27,63 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import modal
+
+# ── Role definitions (product-of-experts axis separation) ─────────────────
+# Each role gets a decorrelated prompt frame. Same model, orthogonal tasks.
+# This enforces ρ ≈ 0 between nodes structurally, not by assumption.
+
+ROLES: dict[str, dict] = {
+    "advocate": {
+        "label": "Advocate",
+        "symbol": "⊕",
+        "description": "Argue for the most correct, well-supported answer",
+        "frame": (
+            "You are the ADVOCATE. Your role is to construct the strongest, "
+            "most well-reasoned answer to the question. Cite your reasoning. "
+            "Do not hedge unnecessarily — commit to a position and defend it."
+        ),
+    },
+    "adversary": {
+        "label": "Adversary",
+        "symbol": "⊖",
+        "description": "Find every flaw, edge case, and wrong assumption",
+        "frame": (
+            "You are the ADVERSARY. Your role is to find every flaw, "
+            "counterexample, hidden assumption, and failure mode in any proposed answer. "
+            "Do not propose a solution — only attack. Be specific and technical."
+        ),
+    },
+    "auditor": {
+        "label": "Auditor",
+        "symbol": "⊗",
+        "description": "Check compliance, legal constraints, and regulatory correctness",
+        "frame": (
+            "You are the AUDITOR. Your role is to check the answer for compliance violations, "
+            "regulatory issues (FCRA, GLBA, HIPAA, ISO 27001, SOC 2), PII exposure, "
+            "deprecated practices, and hardcoded secrets. "
+            "Flag every violation. Ignore elegance — correctness is the only metric."
+        ),
+    },
+}
+
+DEFAULT_ROLE_SEQUENCE = ["advocate", "adversary", "auditor"]
+
+
+def _assign_roles(model_list: list[str]) -> list[dict]:
+    """Assign roles to models. If more models than roles, cycle roles."""
+    assignments = []
+    for i, model in enumerate(model_list):
+        role_key = DEFAULT_ROLE_SEQUENCE[i % len(DEFAULT_ROLE_SEQUENCE)]
+        role = ROLES[role_key]
+        assignments.append({
+            "model": model,
+            "role": role_key,
+            "label": role["label"],
+            "symbol": role["symbol"],
+            "frame": role["frame"],
+        })
+    return assignments
+
 
 # ── Modal primitives ───────────────────────────────────────────────────────
 
@@ -388,23 +451,33 @@ def main(
     refine: bool = False,
 ):
     model_list = [m.strip() for m in models.split(",")]
+    assignments = _assign_roles(model_list)
     session_id = str(uuid.uuid4())[:8]
     width = 72
 
+    role_summary = "  ".join(f"{a['symbol']}{a['label']}[{a['model']}]" for a in assignments)
+
     print(f"\n{'═'*width}")
-    print(f"  BRAID SESSION {session_id}  |  {len(model_list)} models  |  Modal GPU")
+    print(f"  BRAID SESSION {session_id}  |  Modal GPU")
+    print(f"  {role_summary}")
     print(f"{'═'*width}")
 
     # ── PHASE 0: PRE ──────────────────────────────────────────────────────
     print(f"\n── PHASE 0: PRE (sealing plan via {synthesizer}) " + "─"*(width-48-len(synthesizer)))
 
+    role_descriptions = "\n".join(
+        f"  {a['symbol']} {a['label']} ({a['model']}): {ROLES[a['role']]['description']}"
+        for a in assignments
+    )
+
     pre_prompt = (
         f"INSTRUCTION: Respond with plain text only. Do not call any tools.\n\n"
-        f"You are about to coordinate a multi-model query. The user's question is: \"{question}\"\n\n"
-        f"The following models will each independently answer it: {', '.join(model_list)}.\n\n"
+        f"You are about to coordinate a structured multi-role query. "
+        f"The user's question is: \"{question}\"\n\n"
+        f"The following roles will each independently address it:\n{role_descriptions}\n\n"
         f"Before they run, state in 2-3 sentences: "
-        f"(1) what a good answer looks like, "
-        f"(2) what disagreements you expect between models, "
+        f"(1) what a correct answer looks like, "
+        f"(2) what tensions you expect between roles (Advocate vs Adversary vs Auditor), "
         f"(3) what verification criterion you will use — be explicit about what would cause FAIL. "
         f"This is your sealed plan (Γ) — you cannot revise it later."
     )
@@ -413,36 +486,49 @@ def main(
     sealed_plan = pre_result.get("text", "(no plan)")
     print(f"\nΓ (sealed plan):\n{sealed_plan}\n")
 
-    # Store sealed plan in shared Dict
+    # Store sealed plan and role assignments in shared Dict
     session_dict[f"{session_id}:sealed_plan"] = sealed_plan
+    session_dict[f"{session_id}:roles"] = json.dumps([
+        {"model": a["model"], "role": a["role"], "label": a["label"]} for a in assignments
+    ])
 
-    # ── PHASE 1: PER (parallel model inference) ────────────────────────────
-    print(f"\n── PHASE 1: PER ({len(model_list)} models in parallel on Modal GPU) " + "─"*(width-52-len(model_list)*2))
+    # ── PHASE 1: PER (parallel role inference) ────────────────────────────
+    print(f"\n── PHASE 1: PER ({len(assignments)} roles in parallel on Modal GPU) " + "─"*(width-52-len(assignments)*2))
 
-    per_prompt = (
-        f"SEALED PLAN (Γ): {sealed_plan}\n\n"
-        f"Question: {question}\n\n"
-        f"Answer concisely and accurately. The synthesizer will check your response against Γ."
-    )
-
-    # True parallel dispatch — each model gets its own container
+    # Each role gets its own decorrelated axis prompt — product-of-experts
     per_futures = [
-        run_model.spawn(model, per_prompt, session_id, "per")
-        for model in model_list
+        run_model.spawn(
+            a["model"],
+            (
+                f"{a['frame']}\n\n"
+                f"SEALED PLAN (Γ): {sealed_plan}\n\n"
+                f"Question: {question}\n\n"
+                f"Respond in character as the {a['label']}. Be specific."
+            ),
+            session_id,
+            f"per:{a['role']}",
+        )
+        for a in assignments
     ]
     responses = [f.get() for f in per_futures]
 
+    # Tag each response with its role
+    for r, a in zip(responses, assignments):
+        r["role"] = a["role"]
+        r["role_label"] = a["label"]
+        r["symbol"] = a["symbol"]
+
     for r in responses:
-        model_name = r["model"]
         latency = r.get("latency_ms", 0)
         verdict = r.get("fault_verdict", "pass")
         text_preview = (r.get("text") or "")[:120]
-        print(f"\n[{model_name}] ({latency}ms) verdict={verdict}")
+        tag = f"{r['symbol']}{r['role_label']}[{r['model']}]"
+        print(f"\n{tag} ({latency}ms) verdict={verdict}")
         if r.get("findings"):
             for finding in r["findings"]:
                 print(f"  ⚠ [{finding['rule']}] {finding['verdict']}: {finding['reason'][:80]}")
         print(f"  {text_preview}{'...' if len(r.get('text',''))>120 else ''}")
-        session_dict[f"{session_id}:per:{model_name}"] = r.get("text", "")
+        session_dict[f"{session_id}:per:{r['role']}"] = r.get("text", "")
 
     # ── PHASE 2: POST (synthesis + verification) ──────────────────────────
     print(f"\n── PHASE 2: POST (synthesis via {synthesizer}) " + "─"*(width-43-len(synthesizer)))
@@ -453,17 +539,20 @@ def main(
         return
 
     response_block = "\n\n".join(
-        f"[{r['model']}]: {(r['text'] or '')[:400]}"
+        f"[{r['symbol']}{r['role_label']} / {r['model']}]:\n{(r['text'] or '')[:400]}"
         for r in valid_responses
     )
 
     post_prompt = (
         f"SEALED PLAN (Γ): {sealed_plan}\n\n"
         f"QUESTION: {question}\n\n"
-        f"MODEL RESPONSES:\n{response_block}\n\n"
-        f"Your task:\n"
-        f"## Synthesized Answer\n[Combine the best elements of the responses]\n\n"
-        f"## Contradictions\n[Note any genuine disagreements between models]\n\n"
+        f"ROLE RESPONSES (each model operated under a different axis):\n{response_block}\n\n"
+        f"Your task as Synthesis:\n"
+        f"## Synthesized Answer\n"
+        f"[Reconcile the Advocate's best argument, the Adversary's strongest objection, "
+        f"and the Auditor's compliance findings into a single correct answer]\n\n"
+        f"## Role Tensions\n[What did the Advocate and Adversary most sharply disagree on?]\n\n"
+        f"## Audit Flags\n[List any compliance or constraint violations the Auditor found]\n\n"
         f"## Verification\n[PASS or FAIL with reason, judged against Γ]"
     )
 
@@ -485,7 +574,7 @@ def main(
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "sessionID": session_id,
         "question": question[:100],
-        "models": model_list,
+        "roles": [{"model": a["model"], "role": a["role"]} for a in assignments],
         "verdict": "FAIL" if is_fail else "PASS",
         "verdict_body": verdict_body[:200],
     }
