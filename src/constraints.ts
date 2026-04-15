@@ -36,14 +36,67 @@ export const CONSTRAINT_SETS: ConstraintSet[] = [
     ],
   },
   {
-    id: "compliance",
-    description: "FCRA / GLBA / HIPAA compliance guardrails",
+    id: "fcra",
+    description: "Fair Credit Reporting Act (15 U.S.C. §1681) compliance",
     rules: [
-      "Do not generate adverse action language without citing the specific regulatory basis (FCRA §615, ECOA §202.9, etc.).",
-      "Never surface PII (SSN, DOB, account numbers, full name + address combos) in tool outputs, reasoning traces, or responses.",
-      "All credit-relevant decisions must include an explanation traceable to input factors — no black-box conclusions.",
-      "Flag any action that would modify a consumer record. Require explicit confirmation and log the intent before proceeding.",
-      "Taint propagation: if any input is marked sensitive (L_high in the taint lattice), all downstream tool calls inherit that taint until explicitly declassified.",
+      "FCRA §604: Only access consumer reports for a permissible purpose. Halt and surface the legal basis before any consumer report retrieval.",
+      "FCRA §607(b): Do not use consumer report data in any tool output without verifying the requester has a permissible purpose on record.",
+      "FCRA §611: If a data element is disputed, flag it as unverified. Do not use disputed information in a decision without surfacing the dispute status.",
+      "FCRA §615(a): Any adverse action derived from a consumer report MUST include: name/address of CRA, right-to-copy notice, right-to-dispute notice. Refuse to emit adverse action language that omits these.",
+      "FCRA §623: Do not furnish information you know to be inaccurate to any CRA. Taint any output derived from unverified sources with L_high before passing downstream.",
+      "Retention: Consumer report data must not persist beyond the immediate transaction context. Flag any attempt to write CRA data to a durable store.",
+    ],
+  },
+  {
+    id: "glba",
+    description: "Gramm-Leach-Bliley Act (15 U.S.C. §6801) — financial data privacy",
+    rules: [
+      "GLBA §501: Treat all nonpublic personal financial information (NPI) as L_high taint. NPI includes account numbers, balances, transaction history, credit scores, and any data derived from them.",
+      "GLBA §502: Do not disclose NPI to non-affiliated third parties without verifying an opt-out check or an enumerated exception (§502(b)). Surface the exception basis before any disclosure tool call.",
+      "GLBA §503: Before any NPI processing session, verify a current privacy notice is on file for the consumer. If absent, halt and require one.",
+      "GLBA Safeguards Rule (16 CFR §314): All tool outputs containing NPI must be encrypted in transit. Flag any tool call that would emit NPI to an unencrypted channel.",
+      "GLBA pretexting (§521): Never impersonate a consumer, financial institution, or regulator in any tool call or prompt. Any social-engineering-adjacent action is a GLBA §521 violation — refuse and audit.",
+      "Taint inheritance: NPI taint propagates through all derived outputs. A tool that receives NPI as input produces NPI-tainted output regardless of transformation.",
+    ],
+  },
+  {
+    id: "hipaa",
+    description: "Health Insurance Portability and Accountability Act (45 CFR §164) — PHI protection",
+    rules: [
+      "HIPAA Privacy Rule (§164.502): Do not use or disclose Protected Health Information (PHI) without a valid authorization or an enumerated exception. PHI includes any data that could identify an individual combined with health, treatment, or payment information.",
+      "HIPAA Minimum Necessary (§164.502(b)): Limit every tool call to the minimum PHI required for the stated purpose. Do not retrieve or surface PHI fields not needed for the current task.",
+      "HIPAA Security Rule (§164.312): PHI in tool outputs must be treated as requiring access controls, audit logging, and encryption. Flag any PHI written to an unsecured channel or store.",
+      "HIPAA Breach Notification (§164.400): If a tool call produces unauthorized PHI disclosure, immediately flag as a potential breach. Do not attempt to self-remediate — surface to the operator and halt.",
+      "De-identification (§164.514): Only treat data as de-identified if all 18 HIPAA Safe Harbor identifiers have been removed. Do not assume de-identification from partial removal.",
+      "Business Associate logic: If a tool call routes PHI to an external service, verify a BAA is on record for that service before proceeding.",
+    ],
+  },
+  {
+    id: "iso27001",
+    description: "ISO/IEC 27001:2022 — Information Security Management",
+    rules: [
+      "ISO 27001 A.8.2 (Information Classification): Before any tool call involving data, classify the data asset (Public / Internal / Confidential / Restricted). Refuse to process Restricted data without explicit authorization in the current session.",
+      "ISO 27001 A.8.3 (Media Handling): Do not write sensitive data to removable or uncontrolled media via tool calls. Flag any file-write tool call that targets a path outside the declared secure workspace.",
+      "ISO 27001 A.8.15 (Logging): All tool calls must produce an audit log entry. A tool call with no corresponding audit entry is a control failure — flag and halt the chain.",
+      "ISO 27001 A.8.24 (Cryptography): Do not propose or use deprecated cryptographic algorithms (MD5, SHA-1, DES, 3DES, RC4). Flag any tool output referencing these.",
+      "ISO 27001 A.8.28 (Secure Coding): Any code generated must not introduce: SQL injection vectors, hardcoded credentials, unvalidated redirects, or insecure deserialization. Refuse to emit code that violates OWASP Top 10.",
+      "ISO 27001 A.5.23 (Supplier Security): Before routing data to any external API or service, verify the supplier appears in the approved vendor register. Unknown endpoints are a control gap — surface before proceeding.",
+      "ISO 27001 A.6.8 (Incident Reporting): If a tool call produces an anomalous result (unexpected data, access denied, rate limit), treat it as a potential security event. Log it, do not retry silently.",
+    ],
+  },
+  {
+    id: "soc",
+    description: "SOC 1 / SOC 2 / SOC 3 — Trust Services Criteria (AICPA TSC 2017)",
+    rules: [
+      "SOC 2 CC6.1 (Logical Access): Do not attempt to access resources beyond the declared scope of the current session. Any tool call that escalates privilege or crosses a trust boundary must be surfaced and confirmed.",
+      "SOC 2 CC6.3 (Access Removal): If a tool call reveals a stale or orphaned credential, flag it as a SOC CC6.3 finding. Do not use stale credentials — surface and halt.",
+      "SOC 2 CC7.1 (System Monitoring): Anomalous tool outputs (unexpected schemas, missing required fields, statistically outlying values) are monitoring signals. Log them with severity before continuing.",
+      "SOC 2 CC7.2 (Incident Detection): A sequence of tool failures (≥2 consecutive errors from the same tool) is an incident indicator. Escalate rather than retry indefinitely.",
+      "SOC 2 CC8.1 (Change Management): Any proposed modification to system configuration, code, or data schema must be treated as a change event. Surface the change, its blast radius, and require confirmation.",
+      "SOC 2 A1.1 (Availability): Do not issue tool calls that could exhaust rate limits or quotas silently. Track consumption and warn before hitting thresholds.",
+      "SOC 2 PI1.1 (Processing Integrity): Tool outputs used in financial or compliance decisions must be traceable to their source inputs. Refuse to emit a decision whose inputs cannot be reconstructed from the audit log.",
+      "SOC 1 ITGC: All tool calls that modify financial records are in-scope for SOC 1 ITGC. Log the before/after state, the operator identity, and the business justification.",
+      "SOC 3: Public-facing outputs derived from SOC 2 controlled systems must not reveal internal control details, system architecture, or security configurations.",
     ],
   },
   {
@@ -59,7 +112,16 @@ export const CONSTRAINT_SETS: ConstraintSet[] = [
   },
 ];
 
-export const DEFAULT_ACTIVE = ["tool-algebra", "braille-bottleneck", "compliance", "verification"];
+export const DEFAULT_ACTIVE = [
+  "tool-algebra",
+  "braille-bottleneck",
+  "fcra",
+  "glba",
+  "hipaa",
+  "iso27001",
+  "soc",
+  "verification",
+];
 
 export function getActiveConstraints(ids: string[]): string[] {
   return CONSTRAINT_SETS.filter((s) => ids.includes(s.id)).flatMap((s) =>
