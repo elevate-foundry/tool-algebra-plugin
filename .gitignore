@@ -2,3 +2,5 @@ node_modules/
 dist/
 *.js.map
 .playwright-mcp/
+__pycache__/
+*.pyc
