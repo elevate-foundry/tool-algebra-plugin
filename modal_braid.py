@@ -520,7 +520,28 @@ async function runBraid() {
   document.getElementById('audit-link').innerHTML = '';
   ['phase-pre','phase-per','phase-post'].forEach(id => document.getElementById(id).style.display='none');
 
-  setStatus('Sealing plan...', true);
+  let _startTs = Date.now();
+  let _timerInterval = setInterval(() => {
+    const el = document.getElementById('status');
+    if (el && el.dataset.spinning === '1') {
+      const s = Math.floor((Date.now() - _startTs) / 1000);
+      el.innerHTML = '<span class="spinner">&#8635;</span> ' + el.dataset.msg + ' (' + s + 's)';
+    }
+  }, 1000);
+
+  function setStatusTimed(msg) {
+    const el = document.getElementById('status');
+    el.dataset.spinning = '1';
+    el.dataset.msg = msg;
+    el.innerHTML = '<span class="spinner">&#8635;</span> ' + msg + ' (0s)';
+  }
+
+  function clearTimer() {
+    clearInterval(_timerInterval);
+    document.getElementById('status').dataset.spinning = '0';
+  }
+
+  setStatusTimed('Sealing plan...');
 
   const es = new EventSource('/braid/stream?question=' + encodeURIComponent(question));
 
@@ -528,7 +549,8 @@ async function runBraid() {
     const d = JSON.parse(e.data);
     document.getElementById('sealed-plan-text').textContent = d.sealed_plan || '';
     show('phase-pre');
-    setStatus('Running ' + (d.n_roles||3) + ' roles in parallel...', true);
+    _startTs = Date.now();
+    setStatusTimed('Running ' + (d.n_roles||3) + ' roles in parallel...');
   });
 
   es.addEventListener('per_model_done', e => {
@@ -546,19 +568,22 @@ async function runBraid() {
     banner.className = 'verdict-banner ' + (isPass ? 'pass' : 'fail');
     banner.textContent = isPass ? 'VERIFICATION: PASS' : 'VERIFICATION: FAIL';
     show('phase-post');
-    setStatus('Synthesis complete.', false);
+    clearTimer();
+    setStatus('Synthesis complete.');
   });
 
   es.addEventListener('session_complete', e => {
     const d = JSON.parse(e.data);
     document.getElementById('audit-link').innerHTML =
       `Session <code>${d.session_id}</code> &mdash; <a href="/audit_log?last_n=5">View audit log</a>`;
+    clearTimer();
     document.getElementById('run-btn').disabled = false;
     es.close();
     setStatus('');
   });
 
   es.onerror = () => {
+    clearTimer();
     setStatus('Stream error or complete.');
     document.getElementById('run-btn').disabled = false;
     es.close();
@@ -574,218 +599,185 @@ document.getElementById('question').addEventListener('keydown', e => {
 """
 
 
-@app.function(image=base_image)
-@modal.fastapi_endpoint(method="GET")
-def ui() -> "fastapi.responses.HTMLResponse":
-    """Serve the braid streaming UI."""
-    from fastapi.responses import HTMLResponse
-    return HTMLResponse(UI_HTML)
-
-
-# ── Streaming braid endpoint ───────────────────────────────────────────────
+# ── Single ASGI app — all routes share one URL base ──────────────────────────
+# GET  /               → UI
+# GET  /braid/stream   → SSE stream
+# POST /verify_claim   → claim verification
+# GET  /audit_log      → audit history
 
 @app.function(
     image=base_image,
+    volumes={AUDIT_MOUNT: audit_volume},
     timeout=600,
 )
-@modal.fastapi_endpoint(method="GET")
-def braid_stream(
-    question: str,
-    models: str = "qwen2.5:latest,llama3.2:latest,mistral:latest",
-    synthesizer: str = "qwen2.5:latest",
-) -> "fastapi.responses.StreamingResponse":
-    """
-    SSE stream for a full braid run. Connect with EventSource('/braid/stream?question=...').
-    Emits: pre_done, per_model_done (×N), post_done, session_complete
-    """
-    from fastapi.responses import StreamingResponse
+@modal.asgi_app()
+def web():
+    from fastapi import FastAPI, Request
+    from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
-    model_list = [m.strip() for m in models.split(",")]
-    assignments = _assign_roles(model_list)
-    session_id = str(uuid.uuid4())[:8]
+    api = FastAPI()
 
-    def generate():
-        # ── PRE ──────────────────────────────────────────────────────────
-        role_descriptions = "\n".join(
-            f"  {a['symbol']} {a['label']} ({a['model']}): {ROLES[a['role']]['description']}"
-            for a in assignments
-        )
-        pre_prompt = (
-            f"INSTRUCTION: Respond with plain text only. Do not call any tools.\n\n"
-            f"You are about to coordinate a structured multi-role query. "
-            f"The user's question is: \"{question}\"\n\n"
-            f"The following roles will each independently address it:\n{role_descriptions}\n\n"
-            f"Before they run, state in 2-3 sentences: "
-            f"(1) what a correct answer looks like, "
-            f"(2) what tensions you expect between roles, "
-            f"(3) what verification criterion you will use — be explicit about what would cause FAIL. "
-            f"This is your sealed plan (Γ) — you cannot revise it later."
-        )
-        pre_result = run_model.remote(synthesizer, pre_prompt, session_id, "pre")
-        sealed_plan = pre_result.get("text", "(no plan)")
-        session_dict[f"{session_id}:sealed_plan"] = sealed_plan
+    @api.get("/")
+    def serve_ui():
+        return HTMLResponse(UI_HTML)
 
-        yield _sse("pre_done", {
-            "sealed_plan": sealed_plan,
-            "session_id": session_id,
-            "n_roles": len(assignments),
-            "latency_ms": pre_result.get("latency_ms", 0),
-        })
+    @api.get("/braid/stream")
+    def stream(
+        question: str,
+        models: str = "qwen2.5:latest,llama3.2:latest,mistral:latest",
+        synthesizer: str = "qwen2.5:latest",
+    ):
+        model_list = [m.strip() for m in models.split(",")]
+        assignments = _assign_roles(model_list)
+        session_id = str(uuid.uuid4())[:8]
 
-        # ── PER (parallel) ────────────────────────────────────────────────
-        per_futures = [
-            run_model.spawn(
-                a["model"],
-                (
-                    f"{a['frame']}\n\n"
-                    f"SEALED PLAN (Γ): {sealed_plan}\n\n"
-                    f"Question: {question}\n\n"
-                    f"Respond in character as the {a['label']}. Be specific."
-                ),
-                session_id,
-                f"per:{a['role']}",
+        def generate():
+            # Heartbeat thread — keeps SSE alive during GPU cold start
+            import threading
+            _stop = threading.Event()
+            _queue: list[str] = []
+
+            def _heartbeat():
+                while not _stop.is_set():
+                    _stop.wait(15)
+                    if not _stop.is_set():
+                        _queue.append(": ping\n\n")
+
+            hb = threading.Thread(target=_heartbeat, daemon=True)
+            hb.start()
+
+            def _flush_heartbeats():
+                while _queue:
+                    yield _queue.pop(0)
+
+            # PRE
+            role_descriptions = "\n".join(
+                f"  {a['symbol']} {a['label']} ({a['model']}): {ROLES[a['role']]['description']}"
+                for a in assignments
             )
-            for a in assignments
-        ]
-
-        # Emit each role result as it completes
-        for future, assignment in zip(per_futures, assignments):
-            r = future.get()
-            session_dict[f"{session_id}:per:{assignment['role']}"] = r.get("text", "")
-            yield _sse("per_model_done", {
-                "role": assignment["role"],
-                "role_label": assignment["label"],
-                "symbol": assignment["symbol"],
-                "model": assignment["model"],
-                "text": (r.get("text") or "")[:800],
-                "verdict": r.get("fault_verdict", "pass"),
-                "findings": r.get("findings", []),
-                "latency_ms": r.get("latency_ms", 0),
+            pre_prompt = (
+                f"INSTRUCTION: Respond with plain text only. Do not call any tools.\n\n"
+                f"You are about to coordinate a structured multi-role query. "
+                f"The user's question is: \"{question}\"\n\n"
+                f"Roles:\n{role_descriptions}\n\n"
+                f"State in 2-3 sentences: (1) what a correct answer looks like, "
+                f"(2) what tensions you expect between roles, "
+                f"(3) what would cause FAIL. This is your sealed plan (Γ)."
+            )
+            pre_result = run_model.remote(synthesizer, pre_prompt, session_id, "pre")
+            sealed_plan = pre_result.get("text", "(no plan)")
+            session_dict[f"{session_id}:sealed_plan"] = sealed_plan
+            _stop.set()  # stop heartbeat once PRE returns
+            yield from _flush_heartbeats()
+            yield _sse("pre_done", {
+                "sealed_plan": sealed_plan,
+                "session_id": session_id,
+                "n_roles": len(assignments),
+                "latency_ms": pre_result.get("latency_ms", 0),
             })
 
-        # ── POST ──────────────────────────────────────────────────────────
-        # Collect all responses from session_dict
-        per_texts = [
-            (a["symbol"] + a["label"] + f" / {a['model']}",
-             session_dict.get(f"{session_id}:per:{a['role']}", ""))
-            for a in assignments
-        ]
-        response_block = "\n\n".join(f"[{label}]:\n{text[:400]}" for label, text in per_texts if text)
+            # PER — spawn all, collect in order
+            per_futures = [
+                run_model.spawn(
+                    a["model"],
+                    f"{a['frame']}\n\nSEALED PLAN (Γ): {sealed_plan}\n\nQuestion: {question}\n\nRespond as the {a['label']}.",
+                    session_id,
+                    f"per:{a['role']}",
+                )
+                for a in assignments
+            ]
+            per_results = {}
+            for future, a in zip(per_futures, assignments):
+                r = future.get()
+                per_results[a["role"]] = r.get("text", "")
+                session_dict[f"{session_id}:per:{a['role']}"] = per_results[a["role"]]
+                yield _sse("per_model_done", {
+                    "role": a["role"],
+                    "role_label": a["label"],
+                    "symbol": a["symbol"],
+                    "model": a["model"],
+                    "text": (r.get("text") or "")[:800],
+                    "verdict": r.get("fault_verdict", "pass"),
+                    "findings": r.get("findings", []),
+                    "latency_ms": r.get("latency_ms", 0),
+                })
 
-        post_prompt = (
-            f"SEALED PLAN (Γ): {sealed_plan}\n\n"
-            f"QUESTION: {question}\n\n"
-            f"ROLE RESPONSES:\n{response_block}\n\n"
-            f"## Synthesized Answer\n[Reconcile the Advocate, Adversary, and Auditor]\n\n"
-            f"## Role Tensions\n[Sharpest disagreements]\n\n"
-            f"## Audit Flags\n[Compliance violations found]\n\n"
-            f"## Verification\n[PASS or FAIL with reason, judged against Γ]"
+            # POST
+            response_block = "\n\n".join(
+                f"[{a['symbol']}{a['label']} / {a['model']}]:\n{per_results.get(a['role'], '')[:400]}"
+                for a in assignments
+            )
+            post_prompt = (
+                f"SEALED PLAN (Γ): {sealed_plan}\n\nQUESTION: {question}\n\n"
+                f"ROLE RESPONSES:\n{response_block}\n\n"
+                f"## Synthesized Answer\n[Reconcile Advocate, Adversary, Auditor]\n\n"
+                f"## Role Tensions\n[Sharpest disagreements]\n\n"
+                f"## Audit Flags\n[Compliance violations found]\n\n"
+                f"## Verification\n[PASS or FAIL against Γ]"
+            )
+            post_result = run_synthesizer.remote(synthesizer, post_prompt, session_id, "post")
+            synthesis = post_result.get("text", "")
+            verdict_match = re.search(r"## Verification\s*\n(.+?)(?:\n##|$)", synthesis, re.DOTALL)
+            verdict_body = verdict_match.group(1).strip()[:400] if verdict_match else ""
+            is_fail = "fail" in verdict_body.lower()
+            yield _sse("post_done", {
+                "synthesis": synthesis,
+                "verdict": "FAIL" if is_fail else "PASS",
+                "latency_ms": post_result.get("latency_ms", 0),
+            })
+
+            write_audit_entry.remote({
+                "type": "session_complete",
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "sessionID": session_id,
+                "question": question[:100],
+                "roles": [{"model": a["model"], "role": a["role"]} for a in assignments],
+                "verdict": "FAIL" if is_fail else "PASS",
+                "source": "stream",
+            })
+            yield _sse("session_complete", {
+                "session_id": session_id,
+                "verdict": "FAIL" if is_fail else "PASS",
+            })
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
-        post_result = run_synthesizer.remote(synthesizer, post_prompt, session_id, "post")
-        synthesis = post_result.get("text", "")
 
-        verdict_match = re.search(r"## Verification\s*\n(.+?)(?:\n##|$)", synthesis, re.DOTALL)
-        verdict_body = verdict_match.group(1).strip()[:400] if verdict_match else ""
-        is_fail = "fail" in verdict_body.lower()
-
-        yield _sse("post_done", {
-            "synthesis": synthesis,
-            "verdict": "FAIL" if is_fail else "PASS",
-            "verdict_body": verdict_body[:200],
-            "latency_ms": post_result.get("latency_ms", 0),
-        })
-
-        # Audit
-        write_audit_entry.remote({
-            "type": "session_complete",
+    @api.post("/verify_claim")
+    def verify_claim(body: dict):
+        claim = body.get("claim", "")
+        evidence = body.get("evidence", "")
+        session_id = body.get("session_id", "unknown")
+        has_evidence = len(evidence.strip()) > 20
+        verdict = "verified" if has_evidence else "unverified"
+        reason = (
+            f'Evidence accepted: "{evidence[:120]}"'
+            if has_evidence
+            else "No substantive evidence cited."
+        )
+        _write_audit({
+            "type": "verify_called",
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "sessionID": session_id,
-            "question": question[:100],
-            "roles": [{"model": a["model"], "role": a["role"]} for a in assignments],
-            "verdict": "FAIL" if is_fail else "PASS",
-            "verdict_body": verdict_body[:200],
-            "source": "stream",
+            "sessionID": session_id, "claim": claim,
+            "verdict": verdict, "reason": reason,
         })
+        return {"verdict": verdict, "reason": reason, "claim": claim}
 
-        yield _sse("session_complete", {
-            "session_id": session_id,
-            "verdict": "FAIL" if is_fail else "PASS",
-        })
+    @api.get("/audit_log")
+    def audit_log_route(last_n: int = 10):
+        audit_volume.reload()
+        try:
+            with open(AUDIT_FILE) as f:
+                lines = [l.strip() for l in f if l.strip()]
+            entries = [json.loads(l) for l in lines[-last_n:]]
+            return {"count": len(entries), "entries": entries}
+        except FileNotFoundError:
+            return {"count": 0, "entries": []}
 
-    return StreamingResponse(
-        generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-# ── Web endpoints: verify_claim and audit_log ──────────────────────────────
-
-@app.function(
-    image=base_image,
-    volumes={AUDIT_MOUNT: audit_volume},
-)
-@modal.fastapi_endpoint(method="POST")
-def verify_claim(body: dict) -> dict:
-    """
-    POST {"session_id": "...", "claim": "...", "evidence": "..."}
-    Returns {"verdict": "verified"|"unverified", "reason": "..."}
-    Writes to audit volume.
-    """
-    claim = body.get("claim", "")
-    evidence = body.get("evidence", "")
-    session_id = body.get("session_id", "unknown")
-
-    has_evidence = len(evidence.strip()) > 20
-    verdict = "verified" if has_evidence else "unverified"
-    reason = (
-        f'Evidence accepted: "{evidence[:120]}"'
-        if has_evidence
-        else "No substantive evidence cited. Cannot confirm claim."
-    )
-
-    entry = {
-        "type": "verify_called",
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "sessionID": session_id,
-        "claim": claim,
-        "verdict": verdict,
-        "reason": reason,
-    }
-    _write_audit(entry)
-
-    return {
-        "verdict": verdict,
-        "reason": reason,
-        "claim": claim,
-        "message": (
-            f"VERIFIED: {claim}" if verdict == "verified"
-            else f"UNVERIFIED: {claim}\n{reason}"
-        ),
-    }
-
-
-@app.function(
-    image=base_image,
-    volumes={AUDIT_MOUNT: audit_volume},
-)
-@modal.fastapi_endpoint(method="GET")
-def audit_log(last_n: int = 10) -> dict:
-    """
-    GET /audit_log?last_n=20
-    Returns last N audit entries from the persistent volume.
-    """
-    audit_volume.reload()
-    try:
-        with open(AUDIT_FILE) as f:
-            lines = [l.strip() for l in f if l.strip()]
-        entries = [json.loads(l) for l in lines[-last_n:]]
-        return {"count": len(entries), "entries": entries}
-    except FileNotFoundError:
-        return {"count": 0, "entries": []}
+    return api
 
 
 # ── Braid orchestrator (the main entrypoint) ───────────────────────────────
