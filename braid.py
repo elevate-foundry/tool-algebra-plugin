@@ -34,7 +34,8 @@ import subprocess
 import sys
 import time
 from braid_log import (
-    new_session, record_phase, finalize_session, print_history, BraidSession
+    new_session, record_phase, finalize_session, print_history, BraidSession,
+    LOG_PATH,
 )
 from dataclasses import dataclass, field
 from typing import Optional
@@ -320,7 +321,7 @@ async def braid(
 
     if verbose:
         print(f"Total model responses: {len(successful)}/{len(models)}")
-        print(f"Audit log: ~/.local/share/opencode/verifier-audit.jsonl")
+        print(f"Session log: {LOG_PATH}  (git LFS tracked)")
         # show last few audit entries
         audit_path = os.path.expanduser("~/.local/share/opencode/verifier-audit.jsonl")
         if os.path.exists(audit_path):

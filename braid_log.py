@@ -15,13 +15,15 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-LOG_PATH = Path.home() / ".local" / "share" / "opencode" / "braid-sessions.jsonl"
-BRAID_SCRIPT = Path(__file__).parent / "braid.py"
+REPO_ROOT = Path(__file__).parent
+LOG_PATH = REPO_ROOT / "data" / "braid-sessions.jsonl"
+BRAID_SCRIPT = REPO_ROOT / "braid.py"
 
 # Sections whose presence we track as structural invariants.
 # If these disappear from braid.py, integrity check fails.
@@ -186,6 +188,30 @@ def record_phase(session: BraidSession, phase: str, model: str,
     ))
 
 
+def _git_commit_session(session_id: str, run_number: int) -> None:
+    """Auto-commit the updated JSONL to git after each session."""
+    try:
+        subprocess.run(
+            ["git", "add", str(LOG_PATH)],
+            cwd=REPO_ROOT, capture_output=True, timeout=10
+        )
+        subprocess.run(
+            ["git", "commit", "-m",
+             f"data: braid session {session_id} (run #{run_number})"],
+            cwd=REPO_ROOT, capture_output=True, timeout=15
+        )
+        result = subprocess.run(
+            ["git", "push"],
+            cwd=REPO_ROOT, capture_output=True, timeout=30
+        )
+        if result.returncode == 0:
+            print(f"  [log] pushed run #{run_number} to git")
+        else:
+            print(f"  [log] git push failed (offline?): {result.stderr.decode()[:80]}")
+    except Exception as e:
+        print(f"  [log] git commit skipped: {e}")
+
+
 def finalize_session(session: BraidSession, post_text: str, wall_ms: int) -> None:
     session.total_wall_ms = wall_ms
     session.section_parse = _parse_sections(post_text)
@@ -202,16 +228,15 @@ def finalize_session(session: BraidSession, post_text: str, wall_ms: int) -> Non
         for m in integrity.invariants_missing:
             print(f"  ✗ {m!r}")
         print(f"  SHA-256: {integrity.sha256}")
-    
+
     parse = session.section_parse
-    if parse.missing:
-        pass  # already warned inline during run
     if parse.verification_verdict == "fail":
         print(f"\n  [log] Verification: FAIL — synthesis did not satisfy sealed plan")
     elif parse.verification_verdict == "pass":
         print(f"\n  [log] Verification: PASS")
 
     print(f"\n  [log] Session {session.session_id} (run #{session.run_number}) → {LOG_PATH}")
+    _git_commit_session(session.session_id, session.run_number)
 
 
 def print_history(n: int = 10) -> None:
