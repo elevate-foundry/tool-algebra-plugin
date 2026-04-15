@@ -59,6 +59,8 @@ class ModelResponse:
     latency_ms: int = 0
     tokens_out: int = 0
     error: Optional[str] = None
+    fault_verdict: Optional[str] = None   # "fault" | "timeout" | "syntax_error" | None
+    fault_stderr: Optional[str] = None    # full stderr when returncode != 0
     events: list[dict] = field(default_factory=list)
 
 
@@ -85,10 +87,27 @@ def _run_opencode_sync(model: str, prompt: str, timeout: int = 120, pure: bool =
             timeout=timeout,
             cwd=OPENCODE_CWD,
         )
+        # Fix 1: structured fault — capture full stderr, classify fault type
+        if result.returncode != 0:
+            stderr = result.stderr or ""
+            fault = "syntax_error" if "SyntaxError" in stderr or "SyntaxError" in result.stdout else "fault"
+            return ModelResponse(
+                model=model, text="",
+                error=f"exit {result.returncode}: {stderr[:200]}",
+                fault_verdict=fault,
+                fault_stderr=stderr,
+                latency_ms=int((time.monotonic() - start) * 1000),
+            )
+
         raw = result.stdout.strip()
         if not raw:
-            stderr_snippet = result.stderr[-300:] if result.stderr else "(no stderr)"
-            return ModelResponse(model=model, text="", error=f"no output. stderr: {stderr_snippet}")
+            stderr_snippet = result.stderr[-400:] if result.stderr else "(no stderr)"
+            return ModelResponse(
+                model=model, text="",
+                error=f"no output",
+                fault_verdict="fault",
+                fault_stderr=stderr_snippet,
+            )
 
         events = []
         text_parts = []
@@ -134,7 +153,8 @@ def _run_opencode_sync(model: str, prompt: str, timeout: int = 120, pure: bool =
         )
 
     except subprocess.TimeoutExpired:
-        return ModelResponse(model=model, text="", error=f"timeout after {timeout}s")
+        return ModelResponse(model=model, text="", error=f"timeout after {timeout}s",
+                             fault_verdict="timeout")
     except FileNotFoundError:
         return ModelResponse(model=model, text="", error="opencode not found in PATH")
     except Exception as e:
@@ -258,6 +278,7 @@ async def braid(
     synthesizer: str,
     verbose: bool = False,
     no_synth_in_pool: bool = False,
+    refine: bool = False,
 ) -> None:
     width = 60
     wall_start = time.monotonic()
@@ -273,21 +294,31 @@ async def braid(
     # ── PHASE 0: PRE ──────────────────────────────────────────────────────────
     # Seal the plan. The synthesizer declares what it's about to do before any
     # model queries run. This is Γ — the immutable intent record.
+    # If a previous FAIL verdict exists (refinement loop), it is fed in here.
     print("── PHASE 0: PRE (sealing plan) " + "─"*(width-31))
     arch_context = _build_context()
-    pre_prompt = (
-        f"INSTRUCTION: Respond with plain text only. Do not call any tools. Do not use browser or filesystem tools.\n\n"
-        f"{arch_context}\n\n"
-        f"You are about to coordinate a multi-model query on this system. "
-        f"The user's question is: \"{prompt}\"\n\n"
-        f"The following models will each independently answer it: {', '.join(models)}.\n\n"
-        f"Before they run, state in 2-3 sentences: "
-        f"(1) what a good answer to this question looks like given the actual codebase above, "
-        f"(2) what disagreements you expect between models, "
-        f"(3) what you will use as the verification criterion for the final synthesis. "
-        f"Be specific. This is your sealed plan (Γ) — you cannot revise it later. "
-        f"Reply with plain text only."
-    )
+
+    def _make_pre_prompt(prior_fail: Optional[str] = None) -> str:
+        fail_block = (
+            f"\nIMPORTANT: A previous braid run on this same question produced Verification: FAIL.\n"
+            f"The failure reason was:\n{prior_fail}\n"
+            f"Your sealed plan MUST explicitly forbid the failure modes above.\n"
+        ) if prior_fail else ""
+        return (
+            f"INSTRUCTION: Respond with plain text only. Do not call any tools.\n\n"
+            f"{arch_context}\n\n"
+            f"{fail_block}"
+            f"You are about to coordinate a multi-model query on this system. "
+            f"The user's question is: \"{prompt}\"\n\n"
+            f"The following models will each independently answer it: {', '.join(models)}.\n\n"
+            f"Before they run, state in 2-3 sentences: "
+            f"(1) what a good answer looks like given the actual codebase above, "
+            f"(2) what disagreements you expect between models, "
+            f"(3) what verification criterion you will use — be explicit about what would cause FAIL. "
+            f"This is your sealed plan (Γ) — you cannot revise it later. Reply with plain text only."
+        )
+
+    pre_prompt = _make_pre_prompt(prior_fail=None)
     pre = await run_opencode(synthesizer, pre_prompt)
     _print_response(pre, label=f"PRE [{synthesizer}]")
     record_phase(session, "pre", synthesizer, pre_prompt, pre.text or "",
@@ -377,22 +408,46 @@ async def braid(
         if missing:
             print(f"\n⚠ POST missing sections: {missing}", file=sys.stderr)
 
+        # ── Fix 2: Contradictions meta-check ───────────────────────
+        # If models proposed things in different languages / different files,
+        # that IS a contradiction even if no explicit disagreement was stated.
+        if len(successful) > 1:
+            langs_mentioned = []
+            for r in successful:
+                has_py  = bool(re.search(r'def |import |\bpython\b', r.text, re.I))
+                has_ts  = bool(re.search(r'const |=>|interface |\btypescript\b', r.text, re.I))
+                has_js  = bool(re.search(r'\bjavascript\b|function\s+\w+\s*\(', r.text, re.I))
+                langs_mentioned.append((r.model, has_py, has_ts, has_js))
+            mixed = len({(p,t,j) for _,p,t,j in langs_mentioned}) > 1
+            if mixed and "None identified" in post.text:
+                meta_flag = (
+                    "\n⚠ META-CONTRADICTION: models proposed code in different languages "
+                    "(synthetic divergence). Contradictions section should not be 'None identified'."
+                )
+                print(meta_flag, file=sys.stderr)
+                # Patch the text in-place for the log (does not re-run)
+                post = ModelResponse(
+                    model=post.model, text=post.text.replace(
+                        "## Contradictions (✗)\nNone identified.",
+                        "## Contradictions (✗)\n[META] Models proposed code in different "
+                        "languages/files — structural contradiction detected by braid engine."
+                    ),
+                    latency_ms=post.latency_ms, tokens_out=post.tokens_out,
+                    events=post.events,
+                )
+
         # ── Detect textual verify_claim and route a real verification call ───
-        # Some models write [verification_claim] or verify_claim(...) as prose
-        # instead of making a real tool call. Intercept and make the call properly.
         textual_verify = re.search(
             r'\[verification[_\s]?claim\]|verify_claim\s*[:(]',
             post.text, re.IGNORECASE
         )
         if textual_verify:
             print(f"\n  [braid] detected textual verify_claim — routing real verification call...")
-            # Extract the Synthesized Answer section as the claim to verify
             synth_match = re.search(
                 r'##\s*Synthesized Answer\s*\n(.+?)(?=##|$)',
                 post.text, re.DOTALL
             )
             claim_text = synth_match.group(1).strip()[:300] if synth_match else post.text[:300]
-
             verify_prompt = (
                 f"INSTRUCTION: Call the verify_claim tool with the following arguments.\n"
                 f"Do not answer in prose. Use the verify_claim tool.\n\n"
@@ -416,6 +471,32 @@ async def braid(
         print(f"{'═'*width}\n")
 
         finalize_session(session, post.text, int((time.monotonic()-wall_start)*1000))
+
+        # ── Fix 3: Phase 0 Refinement loop on FAIL verdict ──────────────
+        # If Verification failed and --refine flag is set, re-run with a
+        # stricter sealed plan that explicitly forbids the observed failure modes.
+        if refine:
+            verdict_m = re.search(r'## Verification\s*\n(.+?)$', post.text, re.DOTALL)
+            verdict_body = verdict_m.group(1).strip()[:400] if verdict_m else ""
+            is_fail = (
+                "fail" in verdict_body.lower()
+                or "does not satisfy" in verdict_body.lower()
+                or missing
+            )
+            if is_fail:
+                print(f"\n── PHASE 0 REFINEMENT (Γ tightening) " + "─"*(width-36))
+                print("  Verification FAIL detected — re-sealing plan with failure context...")
+                refined_pre_prompt = _make_pre_prompt(prior_fail=verdict_body)
+                refined_pre = await run_opencode(synthesizer, refined_pre_prompt)
+                _print_response(refined_pre, label=f"PRE-REFINED [{synthesizer}]")
+                if not refined_pre.error:
+                    print(f"\n  [refine] New sealed plan ready. Re-run braid to apply it.")
+                    record_phase(session, "pre-refined", synthesizer,
+                                 refined_pre_prompt, refined_pre.text or "",
+                                 refined_pre.tokens_out, refined_pre.latency_ms,
+                                 refined_pre.error)
+            else:
+                print(f"\n  [refine] Verification PASS — no refinement needed.")
 
     if verbose:
         print(f"Total model responses: {len(successful)}/{len(models)}")
@@ -443,6 +524,8 @@ def main() -> None:
     parser.add_argument("--no-synth-in-pool", action="store_true",
                         help="Exclude synthesizer from Phase 1 pool to eliminate self-confirmation bias")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--refine", action="store_true",
+                        help="On Verification FAIL, re-seal Γ with failure context and output refined plan")
     parser.add_argument("--history", action="store_true",
                         help="Print session history and drift analysis, then exit")
     args = parser.parse_args()
@@ -463,6 +546,7 @@ def main() -> None:
         synthesizer=args.synthesizer,
         verbose=args.verbose,
         no_synth_in_pool=args.no_synth_in_pool,
+        refine=args.refine,
     ))
 
 
